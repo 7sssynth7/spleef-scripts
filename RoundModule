@@ -1,0 +1,969 @@
+local MapVoteModule = require(script.Parent.MapVoteController)
+local AliveFolder = game.Workspace:WaitForChild("Alive")
+local DeadFolder = game.Workspace:WaitForChild("Dead")
+
+local MusicRemote = game.ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Music")
+
+local rewardStatsModule = require(game.ServerScriptService.Modules.RewardStats)
+local skinInfo = require(game.ReplicatedStorage.Modules.SkinsInfo)
+
+local risingLava = game.ReplicatedStorage.Assets.Fx.RISINGLAVA
+
+local eventsModule = require(game.ServerScriptService.Modules.EventsModule)
+local BotService = require(game.ServerScriptService.Modules.BotService)
+
+local ss = game:GetService("SoundService")
+local Players = game:GetService("Players")
+local LobbyMusic = ss.LobbyMusic
+
+local remotes = game.ReplicatedStorage.Remotes
+
+local ts = game:GetService("TweenService")
+
+local LavaTargetSize = Vector3.new(723.2, 182.25, 459.7)
+local LavaTargetPos = Vector3.new(130.8, 22.075, -351.05)
+local LavaBottomY = LavaTargetPos.Y - (LavaTargetSize.Y / 2)
+
+local suffixes = {"K", "M", "B", "T", "Qd", "Qn", "Sx", "Sp", "Oc", "No", "Dc"}
+
+local function format(n)
+	if n < 1000 then return tostring(n) end
+	for i = #suffixes, 1, -1 do
+		local threshold = 10 ^ (i * 3)
+		if n >= threshold then
+			local val = n / threshold
+			local str = string.format(val < 10 and "%.2f" or val < 100 and "%.1f" or "%.0f", val)
+			return str .. suffixes[i]
+		end
+	end
+end
+
+local function isLobbyPlayer(player)
+	local character = player.Character
+	return character and character:IsDescendantOf(DeadFolder)
+end
+
+local function StartRisingLava(duration)
+	local lava = risingLava:Clone()
+	lava.Anchored = true
+	lava.Size = Vector3.new(LavaTargetSize.X, 0, LavaTargetSize.Z)
+	lava.CFrame = CFrame.new(LavaTargetPos.X, LavaBottomY, LavaTargetPos.Z)
+	lava.Parent = workspace.Fx
+
+	local tween = ts:Create(lava, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+		Size = LavaTargetSize,
+		Position = LavaTargetPos
+	})
+	tween:Play()
+
+	return lava, tween
+end
+
+local function notice(text)
+	for _, player in pairs(Players:GetPlayers()) do
+		pcall(function()
+			player.PlayerGui.PlayerUIs.NotisBg.Visible = true
+			player.PlayerGui.PlayerUIs.NotisBg.bg.NoticeText.Text = text
+		end)
+	end
+end
+
+local function IsCharacterAliveAndValid(char)
+	if not char then return false end
+	if not char.Parent then return false end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not hrp then return false end
+	if hum.Health <= 0 then return false end
+	return true
+end
+
+local function winnerReference(character)
+	return Players:GetPlayerFromCharacter(character) or character
+end
+
+local function cleanupFolders()
+	for _, deb in pairs(workspace.Debris:GetChildren()) do
+		deb:Destroy()
+	end
+
+	for _, fx in pairs(workspace.Fx:GetChildren()) do
+		fx:Destroy()
+	end
+
+	for _, part in pairs(workspace.Map:GetChildren()) do
+		part:Destroy()
+	end
+
+	remotes.ReplicateBullets:FireAllClients(nil, "Cleanup")
+end
+
+local function EmitWinFX(WinnerChar)
+	if not IsCharacterAliveAndValid(WinnerChar) then return end
+
+	local WinFX = game.ReplicatedStorage.Assets.Fx.WinExp:Clone()
+	WinFX.CFrame = WinnerChar.HumanoidRootPart.CFrame
+	WinFX.Parent = workspace.Fx
+
+	local listOfInstant = {}
+	local listOfDelay = {}
+
+	for _, emitter in pairs(WinFX:GetDescendants()) do
+		if emitter:IsA("ParticleEmitter") then
+			if emitter:GetAttribute("EmitDelay") then
+				table.insert(listOfDelay, emitter)
+			else
+				table.insert(listOfInstant, emitter)
+			end
+		end
+	end
+
+	local closeWorks = game.ReplicatedStorage.Assets.Fx.Fireworks:Clone()
+	closeWorks.Parent = WinnerChar
+
+	local weld = Instance.new("Weld")
+	weld.Part0 = WinnerChar.HumanoidRootPart
+	weld.Part1 = closeWorks.Fireworks
+	weld.Parent = closeWorks.Fireworks
+
+	local weld2 = Instance.new("Weld")
+	weld2.Part0 = WinnerChar.HumanoidRootPart
+	weld2.Part1 = closeWorks.FireworksCopy
+	weld2.Parent = closeWorks.FireworksCopy
+
+	for _, particle in pairs(closeWorks:GetDescendants()) do
+		if particle:IsA("ParticleEmitter") then
+			particle:Emit(particle:GetAttribute("EmitCount"))
+		end
+	end
+
+	local closefireworksfx = game.ReplicatedStorage.Assets.Sfx.Fireworks:Clone()
+	closefireworksfx.Parent = WinnerChar.HumanoidRootPart
+	closefireworksfx.Looped = true
+	closefireworksfx:Play()
+
+	game.Debris:AddItem(closefireworksfx, 3)
+	game.Debris:AddItem(closeWorks, 3)
+
+	for _ = 1, 3 do
+		task.wait(1)
+		if not IsCharacterAliveAndValid(WinnerChar) then break end
+		WinFX.CFrame = WinnerChar.HumanoidRootPart.CFrame
+
+		local shootSFX = game.ReplicatedStorage.Assets.Sfx.FireworkShoot:Clone()
+		shootSFX.Parent = game.SoundService
+		shootSFX.Volume = 2
+		shootSFX:Play()
+		game.Debris:AddItem(shootSFX, shootSFX.TimeLength)
+
+		for _, emitter in listOfInstant do
+			if emitter and emitter.Parent then
+				emitter:Emit(emitter:GetAttribute("EmitCount"))
+			end
+		end
+
+		for _, emitter in listOfDelay do
+			task.delay(emitter:GetAttribute("EmitDelay"), function()
+				if emitter and emitter.Parent then
+					emitter:Emit(emitter:GetAttribute("EmitCount"))
+				end
+				local expSFX = game.ReplicatedStorage.Assets.Sfx.FireworkExplode:Clone()
+				expSFX.Parent = game.SoundService
+				expSFX.Volume = 1
+				expSFX:Play()
+				game.Debris:AddItem(expSFX, expSFX.TimeLength)
+			end)
+		end
+	end
+
+	game.Debris:AddItem(WinFX, 5)
+end
+
+local function killFeed(char, attacker)
+	local feedTemplate = script.FeedTemplate
+	local ti = TweenInfo.new(.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+	for _, plr in game.Players:GetPlayers() do
+		local ui = plr.PlayerGui:FindFirstChild("KillFeed")
+		if not ui then continue end
+		local cont = ui.FeedBg
+
+		local newFeed = feedTemplate:Clone()
+		newFeed.TextLabel.Text = char .. " Died to " .. attacker .. "!"
+
+		newFeed.Parent = cont
+		game.Debris:AddItem(newFeed, 3)
+		newFeed.TextLabel.TextStrokeTransparency = 1
+		newFeed.TextLabel.UIStroke.Transparency = 1
+		newFeed.Skull.ImageTransparency = 1
+
+		ts:Create(newFeed.TextLabel, ti, {TextTransparency = 0}):Play()
+		ts:Create(newFeed.Skull, ti, {ImageTransparency = 0}):Play()
+		ts:Create(newFeed.TextLabel.UIStroke, ti, {Transparency = 0}):Play()
+	end
+end
+
+-- puts the player's chosen gun skin (texture + aura) on their gun
+local function applySkin(player, gun)
+	local activeSkin
+	for _, skin in pairs(player.Skins:GetChildren()) do
+		if skin.Active.Value == true then
+			activeSkin = skin
+			break
+		end
+	end
+
+	if not activeSkin or activeSkin.Name == "Default" then return end
+
+	local info = skinInfo.Skins[activeSkin.Name]
+	if not info then
+		warn("Skin not found in skininfo: " .. activeSkin.Name)
+		return
+	end
+	local decalID = info.Icon
+
+	local mesh = gun:FindFirstChildWhichIsA("SpecialMesh", true)
+	if mesh then
+		mesh.TextureId = decalID
+	else
+		for _, v in pairs(gun:GetDescendants()) do
+			if v:IsA("BasePart") and v.Transparency ~= 1 then
+				for _, face in {"Front", "Back", "Left", "Right", "Top", "Bottom"} do
+					local decal = Instance.new("Decal", v)
+					decal.Texture = decalID
+					decal.Face = Enum.NormalId[face]
+				end
+			end
+		end
+	end
+
+	local auraFolder = game.ReplicatedStorage.Assets.Fx.Skins:FindFirstChild(activeSkin.Name)
+	if not auraFolder then
+		warn("Gun Aura for: " .. activeSkin.Name .. " not found")
+		return
+	end
+
+	local aura = auraFolder.Aura:Clone() :: Model
+
+	local gunSize = gun:GetExtentsSize()
+	local auraSize = aura:GetExtentsSize()
+	local scale = math.max(gunSize.X, gunSize.Y, gunSize.Z) / math.max(auraSize.X, auraSize.Y, auraSize.Z)
+	aura:ScaleTo(scale)
+
+	aura.PrimaryPart.CFrame = gun.Point.CFrame
+	aura.Parent = gun.Point
+
+	local w = Instance.new("Weld", gun.Point)
+	w.Part0 = gun.Point
+	w.Part1 = aura.PrimaryPart
+end
+
+-- clones the player's active gun into their character and welds it to the arm
+local function equipPlayerGun(player, char, hrp, WeaponsFolder)
+	local activeGunVal = player:FindFirstChild("ActiveGun")
+	if not activeGunVal or activeGunVal.Value == "" then return end
+	if not player.Inventory:FindFirstChild(activeGunVal.Value) then return end
+
+	for _, v in char:GetChildren() do
+		if v:IsA("Model") and v:GetAttribute("Weapon") then
+			v:Destroy()
+		end
+	end
+
+	local gunTemplate = WeaponsFolder:FindFirstChild(activeGunVal.Value)
+	if not gunTemplate then
+		warn("Gun not found: " .. activeGunVal.Value)
+		return
+	end
+
+	local chosenGun = gunTemplate:Clone() :: Model
+	chosenGun.Parent = char
+	chosenGun.PrimaryPart.CFrame = hrp.CFrame
+
+	local motor = Instance.new("Motor6D")
+	motor.Name = "WeaponMotor"
+	motor.Part0 = char:FindFirstChild("Right Arm")
+	motor.Part1 = chosenGun.PrimaryPart
+
+	local chosenMotor = WeaponsFolder.Parent.Motors:FindFirstChild(activeGunVal.Value)
+	if chosenMotor then
+		motor.C0 = chosenMotor.C0
+	end
+	motor.Parent = chosenGun.PrimaryPart
+	char:SetAttribute("EquippedWeapon", activeGunVal.Value)
+
+	applySkin(player, chosenGun)
+end
+
+local WeaponsFolder = game.ServerStorage.Weapons
+local module = {}
+module.IntermissionTime = 20
+module.RoundTime = 150
+module.VoteTime = 10
+module.RoundWinner = nil
+module.RoundActive = false
+module.CanVote = false
+
+module.StatsInfo = {}
+module.ActiveEventStop = nil
+module.ActiveLava = nil
+module.ActiveLavaTween = nil
+
+module.VoteStart = function()
+	MapVoteModule.Start()
+	task.wait(module.VoteTime)
+	return MapVoteModule.End()
+end
+
+module.ValidVote = function()
+	return module.CanVote
+end
+
+-- slot machine style text that slows down and lands on the chosen event
+local function cycleEventText(label, events, chosenEvent)
+	local ticks = 20
+	for i = 1, ticks do
+		label.Text = events[math.random(1, #events)].Name
+		local progress = i / ticks
+		task.wait(0.04 + (progress ^ 3) * 0.45)
+	end
+	label.Text = chosenEvent.Name
+end
+
+local function tweenEventBg(randBg, events, chosenEvent)
+	local ti = TweenInfo.new(.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+	randBg.Visible = true
+	randBg.Sep.UIGradient.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.5, 1),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	randBg.RandomEvent.TextTransparency = 1
+	randBg.RandEventTitle.Transparency = 1
+
+	-- tween a NumberValue so the gradient can follow it
+	local proxy = Instance.new("NumberValue")
+	proxy.Value = 0
+
+	local tween = ts:Create(proxy, ti, {Value = 1})
+	proxy:GetPropertyChangedSignal("Value"):Connect(function()
+		randBg.Sep.UIGradient.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.5, proxy.Value),
+			NumberSequenceKeypoint.new(1, 1)
+		})
+	end)
+
+	tween:Play()
+	tween.Completed:Connect(function()
+		proxy:Destroy()
+	end)
+
+	ts:Create(randBg.RandEventTitle, ti, {TextTransparency = 0}):Play()
+	ts:Create(randBg.RandomEvent, ti, {TextTransparency = 0}):Play()
+
+	cycleEventText(randBg.RandomEvent, events, chosenEvent)
+end
+
+local function showMapAndEvent(ChosenMap, chosen, listOfEvents)
+	for _, player in pairs(Players:GetPlayers()) do
+		if not isLobbyPlayer(player) then
+			continue
+		end
+
+		task.spawn(function()
+			player.PlayerGui.PlayerUIs.NotisBg.Visible = false
+
+			local mvGUI = player.PlayerGui.MapVote
+			local MapWinBg = mvGUI.MapWinBg
+			local WinnerTemp = MapWinBg.WinnerTemp
+			local RandBg = MapWinBg.Randbg
+
+			MapWinBg.Visible = true
+			WinnerTemp.Visible = true
+			WinnerTemp.Position = UDim2.fromScale(.5, .5)
+
+			local ogSize = MapWinBg.Size
+			MapWinBg.Size = UDim2.fromScale(.1, .35)
+
+			ts:Create(MapWinBg, TweenInfo.new(.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = ogSize}):Play()
+
+			if ChosenMap.Parent:GetAttribute("Image") then
+				WinnerTemp.MapImage.Image = "rbxassetid://" .. ChosenMap.Parent:GetAttribute("Image")
+			end
+
+			WinnerTemp.MapName.Text = ChosenMap.Name
+			task.wait(3)
+
+			local tweenTempOff = ts:Create(WinnerTemp, TweenInfo.new(.1, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Size = UDim2.fromScale(.1, .35)})
+			tweenTempOff:Play()
+			tweenTempOff.Completed:Connect(function()
+				WinnerTemp.Visible = false
+			end)
+
+			tweenEventBg(RandBg, listOfEvents, chosen)
+		end)
+	end
+
+	task.wait(10)
+
+	for _, player in pairs(Players:GetPlayers()) do
+		local mvGUI = player.PlayerGui.MapVote
+		mvGUI.MapWinBg.Visible = false
+
+		for _, button in pairs(mvGUI.bg.Container:GetChildren()) do
+			if button:IsA("GuiButton") then
+				button:Destroy()
+			end
+		end
+	end
+end
+
+local function clearVoteButtons()
+	for _, player in pairs(Players:GetPlayers()) do
+		task.spawn(function()
+			local mapsCont = player.PlayerGui.MapVote.bg.Container
+			for _, button in pairs(mapsCont:GetChildren()) do
+				if button:IsA("GuiButton") then
+					button:Destroy()
+				end
+			end
+		end)
+	end
+end
+
+module.RoundStart = function(ChosenMap)
+	local oldRig = workspace:FindFirstChild("WonRig")
+	if oldRig then
+		oldRig:SetAttribute("Winner", false)
+	end
+	MusicRemote:FireAllClients("none")
+
+	local MapClone = ChosenMap:Clone()
+	for _, obj in MapClone:GetDescendants() do
+		if obj:IsA("BasePart") then
+			obj:SetAttribute("Destroyable", true)
+		end
+	end
+	task.wait()
+	MapClone.Parent = workspace.Map
+
+	local wonRig = workspace:FindFirstChild("WonRig")
+	if wonRig then
+		wonRig:Destroy()
+	end
+
+	clearVoteButtons()
+
+	local spawnPoints = {}
+	for _, spawnPoint in pairs(MapClone:GetChildren()) do
+		if spawnPoint.Name == "SpawnPoint" then
+			table.insert(spawnPoints, spawnPoint)
+		end
+	end
+	if #spawnPoints == 0 then
+		warn("Map has no SpawnPoints: " .. ChosenMap.Name)
+		module.RoundEnd()
+		return
+	end
+
+	-- pick a random event (lava rise map has its own thing going on)
+	local chosen = nil
+	if MapClone.Name ~= "Lava Rise" then
+		local listOfEvents = eventsModule.Events
+		chosen = listOfEvents[math.random(1, #listOfEvents)]
+		showMapAndEvent(ChosenMap, chosen, listOfEvents)
+	end
+
+	notice("Round Starting...")
+
+	task.wait(2)
+	if MapClone:FindFirstChild("Required") then
+		MapClone.Required.Enabled = true
+	end
+
+	local usedSpawns = {}
+
+	for _, player in pairs(Players:GetPlayers()) do
+		local char = player.Character
+		if not char then continue end
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if not hum or not hrp or hum.Health <= 0 then continue end
+		if char:IsDescendantOf(workspace.Test.Alive) then continue end
+
+		remotes.RS:FireClient(player, "RoundStart")
+
+		for att, _ in char:GetAttributes() do
+			char:SetAttribute(att, false)
+		end
+
+		if hrp.Anchored then
+			hrp.Anchored = false
+		end
+
+		-- prefer spawns nobody is using yet
+		local availableSpawns = {}
+		for _, sp in spawnPoints do
+			if not usedSpawns[sp] then
+				table.insert(availableSpawns, sp)
+			end
+		end
+		local pool = #availableSpawns > 0 and availableSpawns or spawnPoints
+		local randomSpawn = pool[math.random(1, #pool)]
+		usedSpawns[randomSpawn] = true
+
+		hrp.CFrame = randomSpawn.CFrame
+		char.Parent = AliveFolder
+
+		local HL = Instance.new("Highlight", char)
+		HL.FillTransparency = 1
+		HL.OutlineTransparency = .5
+		HL.OutlineColor = Color3.new(1, 1, 1)
+		HL.Name = "GameHL"
+
+		-- snapshot stats so the rewards screen can show the difference
+		module.StatsInfo[player.Name] = {
+			Kills = player.leaderstats.Kills.Value,
+			Exp = player.Config.Exp.Value,
+			Cash = player.leaderstats.Cash.Value,
+			TotalExp = player.Config.MaxExp.Value,
+			Level = player.Config.Level.Value
+		}
+
+		player.PlayerGui.PlayerUIs.NotisBg.Visible = false
+
+		equipPlayerGun(player, char, hrp, WeaponsFolder)
+	end
+
+	BotService:SpawnForRound(spawnPoints, usedSpawns)
+
+	module.RoundActive = true
+	for _, char in pairs(AliveFolder:GetChildren()) do
+		if char:IsA("Model") then
+			char:SetAttribute("Locked", true)
+		end
+	end
+
+	task.delay(1, function()
+		ss.CountDown:Play()
+	end)
+
+	for i = 3, 0, -1 do
+		task.wait(1)
+		for _, char in AliveFolder:GetChildren() do
+			if char:IsA("Model") then
+				char:SetAttribute("Count", i)
+			end
+		end
+	end
+
+	for _, char in pairs(AliveFolder:GetChildren()) do
+		if char:IsA("Model") then
+			char:SetAttribute("Locked", false)
+			char:SetAttribute("Count", false)
+		end
+	end
+	BotService:UnlockRoundBots()
+
+	if chosen then
+		module.ActiveEventStop = chosen.Fn()
+	end
+
+	MusicRemote:FireAllClients("battle")
+
+	-- ends the round when 0 or 1 fighters are left
+	local WinnerCon
+	WinnerCon = game["Run Service"].Heartbeat:Connect(function()
+		if not module.RoundActive then WinnerCon:Disconnect() return end
+		local alive = AliveFolder:GetChildren()
+		if #alive == 1 then
+			module.RoundWinner = winnerReference(alive[1])
+			module.RoundEnd()
+			WinnerCon:Disconnect()
+		elseif #alive == 0 then
+			module.RoundWinner = nil
+			module.RoundEnd()
+			WinnerCon:Disconnect()
+		end
+	end)
+
+	-- exp for dying
+	local deadCon
+	deadCon = AliveFolder.ChildRemoved:Connect(function(char)
+		if not module.RoundActive then return end
+		if not char:IsA("Model") then return end
+
+		local player = Players:FindFirstChild(char.Name)
+		if not player then return end
+
+		rewardStatsModule.GiveExp(player, rewardStatsModule.CalcLoseExp(player))
+	end)
+
+	for _, child in pairs(AliveFolder:GetChildren()) do
+		if child:IsA("Model") and Players:GetPlayerFromCharacter(child) then
+			local hum = child:FindFirstChildOfClass("Humanoid")
+			if not hum then continue end
+			hum.Died:Connect(function()
+				task.wait()
+				killFeed(child.Name, child:GetAttribute("Died") or "Void")
+			end)
+		end
+	end
+
+	local leaveCon
+	leaveCon = Players.PlayerRemoving:Connect(function(leavingPlayer)
+		local char = leavingPlayer.Character
+		if char and char:IsDescendantOf(AliveFolder) then
+			char.Parent = DeadFolder
+		end
+
+		task.wait()
+		if not module.RoundActive then return end
+		local alive = AliveFolder:GetChildren()
+		if #alive == 1 then
+			module.RoundWinner = winnerReference(alive[1])
+			module.RoundEnd()
+		elseif #alive == 0 then
+			module.RoundWinner = nil
+			module.RoundEnd()
+		end
+	end)
+
+	-- main round timer
+	local elapsed = 0
+	local lavaTriggered = false
+
+	while module.RoundActive and elapsed < module.RoundTime do
+		task.wait(1)
+		if not module.RoundActive then
+			break
+		end
+
+		elapsed += 1
+
+		local remaining = module.RoundTime - elapsed
+		local text
+		if remaining > 60 then
+			text = string.format("%d:%02d", math.floor(remaining / 60), remaining % 60)
+		else
+			text = tostring(remaining) .. "s"
+		end
+
+		notice(text)
+
+		-- lava starts rising for the last 30 seconds
+		if not lavaTriggered and remaining <= 30 and ChosenMap.Name ~= "Lava Rise" then
+			if chosen and chosen.Name == "Lava Drain" then continue end
+
+			lavaTriggered = true
+			module.ActiveLava, module.ActiveLavaTween = StartRisingLava(remaining)
+
+			for _, c in pairs(workspace.Alive:GetChildren()) do
+				if c:IsA("Model") and c:FindFirstChild("Humanoid") then
+					local plr = Players:GetPlayerFromCharacter(c)
+					if plr then
+						remotes.RS:FireClient(plr, "RisingLava")
+					end
+				end
+			end
+		end
+	end
+
+	leaveCon:Disconnect()
+	deadCon:Disconnect()
+	pcall(function() WinnerCon:Disconnect() end)
+
+	if module.RoundActive then
+		notice("Time Ran Out!")
+		module.RoundEnd()
+	end
+end
+
+local function showRewards()
+	for _, player in pairs(Players:GetPlayers()) do
+		if not player.Character then continue end
+		local snap = module.StatsInfo[player.Name]
+		if not snap then continue end
+
+		local differenceKills = player.leaderstats.Kills.Value - snap.Kills
+		local differenceCash = player.leaderstats.Cash.Value - snap.Cash
+		local levelDiff = player.Config.Level.Value - snap.Level
+		-- if they leveled up, add the exp bars they went through
+		local differenceExp = math.max(0, player.Config.Exp.Value - snap.Exp + (player.Config.MaxExp.Value * levelDiff))
+
+		local rewardsBg = player.PlayerGui.PlayerUIs.RewardsBg
+		local pat = rewardsBg.RewardsContainer.pat
+
+		rewardsBg.Visible = true
+		pat.KillsTemp.RewardText.Text = "+" .. format(differenceKills)
+		pat.CashTemp.RewardText.Text = "+" .. format(differenceCash)
+		pat.ExpTemp.RewardText.Text = "+" .. format(differenceExp)
+	end
+end
+
+module.RoundEnd = function()
+	if not module.RoundActive then return end
+	module.RoundActive = false
+	BotService:EndRound()
+
+	if module.ActiveEventStop then
+		module.ActiveEventStop()
+		module.ActiveEventStop = nil
+	end
+
+	if module.ActiveLavaTween then
+		module.ActiveLavaTween:Cancel()
+		module.ActiveLavaTween = nil
+	end
+	if module.ActiveLava then
+		module.ActiveLava:Destroy()
+		module.ActiveLava = nil
+	end
+
+	-- send everyone back to the lobby
+	for _, player in pairs(Players:GetPlayers()) do
+		local char = player.Character
+		if not char then continue end
+		if char:IsDescendantOf(workspace.Test.Alive) then continue end
+		remotes.RS:FireClient(player, "RoundEnd")
+
+		pcall(function()
+			char.Parent = DeadFolder
+			if char:FindFirstChild("GameHL") then
+				char.GameHL:Destroy()
+			end
+			char:SetAttribute("EquippedWeapon", nil)
+			for _, v in char:GetChildren() do
+				if v:IsA("Model") and v:GetAttribute("Weapon") then
+					v:Destroy()
+				end
+			end
+		end)
+	end
+
+	cleanupFolders()
+
+	if module.RoundWinner then
+		local winnerPlayer = module.RoundWinner:IsA("Player") and module.RoundWinner or nil
+		local winnerCharacter = winnerPlayer and winnerPlayer.Character or module.RoundWinner
+
+		if winnerCharacter then
+			notice(winnerCharacter.Name .. " won the round!")
+			MusicRemote:FireAllClients("winner")
+
+			if winnerPlayer then
+				rewardStatsModule.GiveWin(winnerPlayer, 1)
+				rewardStatsModule.GiveExp(winnerPlayer, rewardStatsModule.CalcWinExp(winnerPlayer))
+				rewardStatsModule.GiveCash(winnerPlayer, 500)
+
+				if IsCharacterAliveAndValid(winnerCharacter) then
+					task.delay(8, function() EmitWinFX(winnerCharacter) end)
+					game.ServerScriptService.Scripts.PlayWinner.WonRig:SetAttribute("Winner", winnerPlayer.Name)
+				end
+			end
+		end
+		task.wait(8)
+	end
+
+	showRewards()
+	module.StatsInfo = {}
+
+	cleanupFolders()
+
+	MusicRemote:FireAllClients("lobby", math.random(0, math.floor(LobbyMusic.TimeLength * 0.75)))
+	module.RoundWinner = nil
+end
+
+module.IntermissionStart = function()
+	task.wait(3)
+	notice("Intermission...")
+	for _, plr in game.Players:GetPlayers() do
+		remotes.RS:FireClient(plr, "skiesFIX")
+	end
+	task.wait(module.IntermissionTime - 3)
+	notice("Voting...")
+	module.CanVote = true
+
+	local ChosenMap = module.VoteStart()
+	module.CanVote = false
+	if ChosenMap then
+		module.RoundStart(ChosenMap)
+	end
+end
+
+return module
+
+
+
+------------------------ MapVoteController --------------------------
+(ModuleScript, child of the round script / ServerScriptService)
+
+local MapFolder = game.ServerStorage.Maps
+local TemplateFrame = script.MapTemplate
+local DeadFolder = workspace:WaitForChild("Dead")
+
+local module = {}
+module.ChosenMaps = {}
+module.Voted = {}
+module.PreviousVoted = {}
+module.MapSelected = nil
+
+local function isValidMap(name)
+	for _, map in module.ChosenMaps do
+		if map.Name == name then return true end
+	end
+	return false
+end
+
+module.Vote = function(player, mapVoted)
+	if module.Voted[player] == mapVoted then warn("already voted for " .. mapVoted) return end
+	if not isValidMap(mapVoted) then warn("voted for nil map") return end
+
+	module.Voted[player] = mapVoted
+
+	if module.PreviousVoted[player] then
+		local prev = module.PreviousVoted[player]
+		local oldVal = script.Votes:FindFirstChild(prev)
+		if oldVal then oldVal.Value -= 1 end
+	end
+
+	local voteVal = script.Votes:FindFirstChild(mapVoted)
+	if voteVal then voteVal.Value += 1 end
+
+	module.PreviousVoted[player] = mapVoted
+end
+
+local function isLobbyPlayer(player)
+	local character = player.Character
+	return character and character:IsDescendantOf(DeadFolder)
+end
+
+module.Start = function()
+	module.ChosenMaps = {}
+	module.Voted = {}
+	module.PreviousVoted = {}
+	
+	for _, v in script.Votes:GetChildren() do
+		v:Destroy()
+	end
+	
+	for _, plr in game.Players:GetPlayers() do
+		local container = plr.PlayerGui.MapVote.bg.Container
+		for _, child in container:GetChildren() do
+			if child:IsA("Frame") then child:Destroy() end
+		end
+	end
+	
+	local allMaps = MapFolder:GetChildren()
+	for i = #allMaps, 2, -1 do
+		local j = math.random(1, i)
+		allMaps[i], allMaps[j] = allMaps[j], allMaps[i]
+	end
+	for i = 1, math.min(3, #allMaps) do
+		table.insert(module.ChosenMaps, allMaps[i])
+	end
+
+	for _, map in module.ChosenMaps do
+		local voteVal = Instance.new("IntValue", script.Votes)
+		voteVal.Name = map.Name
+		voteVal.Value = 0
+	end
+
+	for _, plr in game.Players:GetPlayers() do
+		if not isLobbyPlayer(plr) then
+			continue
+		end
+		
+		task.spawn(function()
+			local gui = plr.PlayerGui.MapVote
+			local bg = gui.bg
+			local container = bg.Container
+
+			for i, map in ipairs(module.ChosenMaps) do
+				local newFrame = TemplateFrame:Clone()
+				newFrame.MapName.Text = map.Name
+
+				local countBg = newFrame.counterbg
+				local countAmt = countBg.CountAmt
+
+				local voteVal = script.Votes:FindFirstChild(map.Name)
+				if voteVal then
+					countAmt.Text = tostring(voteVal.Value)
+					voteVal.Changed:Connect(function(newVal)
+						countAmt.Text = tostring(newVal)
+					end)
+				end
+
+				if map:GetAttribute("Attribute") then
+					newFrame.Attributes.Text = map:GetAttribute("Attribute")
+				end
+				if map:GetAttribute("Image") then
+					newFrame.MapImage.Image = "rbxassetid://"..map:GetAttribute("Image")
+				end
+				if map:GetAttribute("AttColor") then
+					newFrame.Attributes.BackgroundColor3 = map:GetAttribute("AttColor")
+				end
+				newFrame.ZIndex = newFrame.ZIndex + i
+				for _, desc in newFrame:GetDescendants() do
+					if desc:IsA("GuiObject") then
+						desc.ZIndex = desc.ZIndex + i
+					end
+				end
+				newFrame.Name = map.Name
+				newFrame.Parent = container
+			end
+
+			bg.Visible = true
+		end)
+	end
+end
+
+module.End = function()
+	for _, plr in game.Players:GetPlayers() do
+		task.spawn(function()
+			local gui = plr.PlayerGui.MapVote
+			local bg = gui.bg
+			local container = bg.Container
+
+			for _, child in container:GetChildren() do
+				if child:IsA("Frame") then child:Destroy() end
+			end
+			bg.Visible = false
+		end)
+	end
+
+	local winners = {}
+	local highestVotes = -1
+	for _, vote in script.Votes:GetChildren() do
+		if vote.Value > highestVotes then
+			highestVotes = vote.Value
+			winners = { vote.Name }
+		elseif vote.Value == highestVotes then
+			table.insert(winners, vote.Name)
+		end
+	end
+
+	if highestVotes == 0 then
+		print("Nobody voted! Picking random...")
+		module.MapSelected = module.ChosenMaps[math.random(1, #module.ChosenMaps)].Name
+	else
+		if #winners > 1 then print("Tie! Picking randomly...") end
+		module.MapSelected = winners[math.random(1, #winners)]
+	end
+
+	print("Winning map: " .. (module.MapSelected or "none"))
+
+	for _, vote in script.Votes:GetChildren() do vote:Destroy() end
+
+	local selected = module.MapSelected
+	module.ChosenMaps = {}
+	module.Voted = {}
+	module.PreviousVoted = {}
+	module.MapSelected = nil
+
+	return MapFolder:FindFirstChild(selected):FindFirstChild(selected)
+end
+
+return module
