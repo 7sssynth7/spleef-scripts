@@ -1,1 +1,551 @@
-# BotAI
+local BotService = {}
+
+local Players = game:GetService("Players")
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+
+local ShootModule = require(game.ServerScriptService.Modules.ShootModule)
+
+local minBots = 3
+local maxBots = 3
+local waitAmt = 0.16
+local dropAmt = 5
+local jumpCD = 0.45
+
+local ShootAnim = game.ReplicatedStorage.Assets.Animations.LazerGun.Shoot
+local IdleAnim = game.ReplicatedStorage.Assets.Animations.LazerGun.Idle
+
+local minHeight = 0.15
+local MAXheight = 10
+local shotCD = 1.3
+
+local bots = {}
+
+local MainArena = {
+	name = "Main",
+	aliveFolder = Workspace:WaitForChild("Alive"),
+	deadFolder = Workspace:FindFirstChild("Dead"),
+	killField = Workspace:FindFirstChild("KillForceField"),
+}
+
+local jumpArea = 7
+local jumpDistance = 4
+local attackDistance = 240
+local groundDistance = 12
+
+local TestFolder = Workspace:WaitForChild("Test")
+local TestArena = {
+	name = "Test",
+	aliveFolder = TestFolder:WaitForChild("Alive"),
+	deadFolder = nil,
+	killField = TestFolder:FindFirstChild("KillForceField") or Workspace:FindFirstChild("KillForceField"),
+}
+
+local function getRoot(model)
+	return model and model:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid(model)
+	return model and model:FindFirstChildOfClass("Humanoid")
+end
+
+local function isAlive(model, arena)
+	local humanoid = getHumanoid(model)
+	return model ~= nil and model.Parent == arena.aliveFolder and humanoid ~= nil and humanoid.Health > 0
+end
+
+local function getFighters(except, arena)
+	local fighters = {}
+	for _, model in arena.aliveFolder:GetChildren() do
+		if model:IsA("Model") and model ~= except and isAlive(model, arena) and getRoot(model) then
+			table.insert(fighters, model)
+		end
+	end
+	return fighters
+end
+
+local function getNearestEnemy(bot, arena)
+	local root = getRoot(bot)
+	if not root then return nil end
+
+	local chosen, shortest = nil, math.huge
+	for _, fighter in getFighters(bot, arena) do
+		local fighterRoot = getRoot(fighter)
+		local offset = fighterRoot.Position - root.Position
+		local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+		if distance < shortest then
+			chosen, shortest = fighter, distance
+		end
+	end
+	return chosen, shortest
+end
+
+local function floorBelowFrom(position, ignore, originHeight, depth)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {
+		ignore,
+		MainArena.aliveFolder,
+		MainArena.deadFolder,
+		TestArena.aliveFolder,
+		TestArena.deadFolder,
+		Workspace.Fx,
+		Workspace.Bullets,
+	}
+	local result = Workspace:Raycast(position + Vector3.new(0, originHeight, 0), Vector3.new(0, -(depth or 38), 0), params)
+	if result and result.Normal.Y > 0.5 then
+		return result
+	end
+	return nil
+end
+
+local function floorBelow(position, ignore, depth)
+	return floorBelowFrom(position, ignore, 2, depth)
+end
+
+local function isBelowKillField(hit, arena)
+	return arena.killField and hit.Position.Y <= arena.killField.Position.Y + 3
+end
+
+local function getNavigableFloor(position, bot, currentFloorY, arena)
+	local rayHeight = MAXheight + 4
+	local hit = floorBelowFrom(position, bot, rayHeight, rayHeight + groundDistance)
+	if not hit or isBelowKillField(hit, arena) then return nil end
+
+	local heightDifference = hit.Position.Y - currentFloorY
+	if heightDifference < -dropAmt or heightDifference > MAXheight then
+		return nil
+	end
+	return hit
+end
+
+local function routeIsSafe(fromPosition, toPosition, bot, currentFloorY, arena)
+	local flat = Vector3.new(toPosition.X - fromPosition.X, 0, toPosition.Z - fromPosition.Z)
+	local length = flat.Magnitude
+	if length < 0.1 then return true end
+
+	local gapStartedAt = nil
+	for travelled = 3, length, 3 do
+		local sample = fromPosition + flat.Unit * travelled
+		if getNavigableFloor(sample, bot, currentFloorY, arena) then
+			if gapStartedAt and travelled - gapStartedAt > jumpArea then
+				return false
+			end
+			gapStartedAt = nil
+		else
+			gapStartedAt = gapStartedAt or travelled
+			if travelled - gapStartedAt > jumpArea then
+				return false
+			end
+		end
+	end
+
+	return gapStartedAt == nil
+end
+
+local function getTargetFloor(target, bot)
+	local targetRoot = getRoot(target)
+	if not targetRoot then return nil end
+	local hit = floorBelow(targetRoot.Position, bot, groundDistance)
+	if hit then return hit.Position end
+	return targetRoot.Position - Vector3.new(0, 3, 0)
+end
+
+local function chooseSafeMove(bot, root, enemyRoot, data)
+	local currentFloor = floorBelow(root.Position, bot, groundDistance)
+	if not currentFloor then return nil end
+	local currentFloorY = currentFloor.Position.Y
+	local toEnemy = Vector3.new(enemyRoot.Position.X - root.Position.X, 0, enemyRoot.Position.Z - root.Position.Z)
+	if toEnemy.Magnitude < 0.1 then
+		local look = root.CFrame.LookVector
+		toEnemy = Vector3.new(look.X, 0, look.Z)
+		if toEnemy.Magnitude < 0.1 then toEnemy = Vector3.zAxis end
+	end
+	toEnemy = toEnemy.Unit
+	local side = Vector3.new(-toEnemy.Z, 0, toEnemy.X)
+
+	local directions = {side, -side, -toEnemy, (side - toEnemy).Unit, (-side - toEnemy).Unit, toEnemy}
+	for i = #directions, 2, -1 do
+		local j = data.rng:NextInteger(1, i)
+		directions[i], directions[j] = directions[j], directions[i]
+	end
+	for _, direction in directions do
+		local distance = data.rng:NextNumber(7, 13)
+		local candidate = root.Position + direction * distance
+		if getNavigableFloor(candidate, bot, currentFloorY, data.arena) and routeIsSafe(root.Position, candidate, bot, currentFloorY, data.arena) then
+			return candidate
+		end
+	end
+	return nil
+end
+
+local function playIdle(data)
+	if data.animationState == "shoot" and data.shootTrack and data.shootTrack.IsPlaying then
+		return
+	end
+	if data.shootTrack and data.shootTrack.IsPlaying then
+		data.shootTrack:Stop(0.08)
+	end
+	if data.idleTrack and not data.idleTrack.IsPlaying then
+		data.idleTrack:Play(0.12)
+	end
+	data.animationState = "idle"
+end
+
+local function isSafeSameFloor(position, bot, currentFloorY, arena)
+	local hit = floorBelow(position, bot, groundDistance)
+	if not hit or isBelowKillField(hit, arena) then return false end
+	return math.abs(hit.Position.Y - currentFloorY) <= dropAmt
+end
+
+local function tryDoubleJump(bot, root, humanoid, data)
+	if not data.doubleJumpReady then return end
+	if humanoid.FloorMaterial ~= Enum.Material.Air then return end
+	if root.AssemblyLinearVelocity.Y > -3 then return end
+
+	data.doubleJumpReady = false
+	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+end
+
+local function jumpIsNeeded(bot, root, desired, currentFloorY, data)
+	local direction = Vector3.new(desired.X - root.Position.X, 0, desired.Z - root.Position.Z)
+	if direction.Magnitude < 1 then return false end
+	direction = direction.Unit
+
+	for probeDistance = 1, jumpDistance, 1 do
+		local ledge = getNavigableFloor(root.Position + direction * probeDistance, bot, currentFloorY, data.arena)
+		if ledge and ledge.Position.Y - currentFloorY > minHeight then
+			return true
+		end
+	end
+
+	local ahead = root.Position + direction * jumpDistance
+	if not isSafeSameFloor(ahead, bot, currentFloorY, data.arena) then
+		for distance = jumpDistance + 1, jumpArea + 2 do
+			if isSafeSameFloor(root.Position + direction * distance, bot, currentFloorY, data.arena) then
+				return true
+			end
+		end
+		return false
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {
+		bot,
+		MainArena.aliveFolder,
+		MainArena.deadFolder,
+		TestArena.aliveFolder,
+		TestArena.deadFolder,
+		Workspace.Fx,
+		Workspace.Bullets,
+	}
+	local origin = root.Position - Vector3.new(0, 2, 0)
+	return Workspace:Raycast(origin, direction * jumpDistance, params) ~= nil
+end
+
+local function tryJumpForMovement(bot, root, humanoid, desired, data)
+	if os.clock() < data.nextJumpAt or humanoid.FloorMaterial == Enum.Material.Air then return end
+	local floor = floorBelow(root.Position, bot, groundDistance)
+	if not floor or not jumpIsNeeded(bot, root, desired, floor.Position.Y, data) then return end
+
+	data.nextJumpAt = os.clock() + jumpCD
+	humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+end
+
+local function equipLazerGun(bot)
+	local template = ServerStorage:WaitForChild("Weapons"):FindFirstChild("LazerGun")
+	local root = getRoot(bot)
+	local arm = bot:FindFirstChild("Right Arm")
+	if not template or not root or not arm then
+		warn("needs a Right Arm & LazerGun must exist in ServerStorage.Weapons")
+		return false
+	end
+
+	local gun = template:Clone()
+	gun.Parent = bot
+	gun:PivotTo(root.CFrame)
+	local motor = Instance.new("Motor6D")
+	motor.Name = "WeaponMotor"
+	motor.Part0 = arm
+	motor.Part1 = gun.PrimaryPart
+	local motorTemplate = ServerStorage:FindFirstChild("Motors") and ServerStorage.Motors:FindFirstChild("LazerGun")
+	if motorTemplate then motor.C0 = motorTemplate.C0 end
+	motor.Parent = gun.PrimaryPart
+	bot:SetAttribute("EquippedWeapon", "LazerGun")
+	return true
+end
+
+local function chooseSpawn(spawnPoints, usedSpawns, rng)
+	local open = {}
+	for _, spawn in spawnPoints do
+		if not usedSpawns[spawn] then table.insert(open, spawn) end
+	end
+	local choices = #open > 0 and open or spawnPoints
+	local spawn = choices[rng:NextInteger(1, #choices)]
+	usedSpawns[spawn] = true
+	return spawn
+end
+
+local function destroyBot(bot)
+	local data = bots[bot]
+	if data and data.killConnection then
+		data.killConnection:Disconnect()
+		data.killConnection = nil
+	end
+	bots[bot] = nil
+	if bot and bot.Parent then bot:Destroy() end
+end
+
+local function configureBot(bot, data)
+	local humanoid = getHumanoid(bot)
+	if not humanoid then return end
+
+	humanoid.AutoJumpEnabled = true
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+	local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+	data.idleTrack = animator:LoadAnimation(IdleAnim)
+	data.idleTrack.Looped = true
+	data.idleTrack.Priority = Enum.AnimationPriority.Idle
+	data.shootTrack = animator:LoadAnimation(ShootAnim)
+	data.shootTrack.Looped = false
+	data.shootTrack.Priority = Enum.AnimationPriority.Action
+	playIdle(data)
+
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+
+	humanoid.StateChanged:Connect(function(_, state)
+		if state == Enum.HumanoidStateType.Landed then
+			data.doubleJumpReady = true
+		end
+	end)
+	humanoid.Died:Connect(function()
+		data.alive = false
+		if data.killConnection then data.killConnection:Disconnect() end
+		if not data.isRoundBot then
+			destroyBot(bot)
+			return
+		end
+
+		if bot.Parent then
+			bot.Parent = data.arena.deadFolder or Workspace:FindFirstChild("Dead") or Workspace
+		end
+		game:GetService("Debris"):AddItem(bot, 5)
+	end)
+end
+
+local function playShoot(data)
+	if not data.shootTrack then return end
+	data.animationToken += 1
+	local token = data.animationToken
+	if data.idleTrack and data.idleTrack.IsPlaying then
+		data.idleTrack:Stop(0.08)
+	end
+	data.shootTrack:Play(0.05)
+	data.animationState = "shoot"
+
+	local duration = math.max(data.shootTrack.Length, 0.15)
+	task.delay(duration, function()
+		if data.alive and data.animationToken == token then
+			playIdle(data)
+		end
+	end)
+end
+
+local function runBrain(bot, data)
+	while data.alive and isAlive(bot, data.arena) do
+		local root, humanoid = getRoot(bot), getHumanoid(bot)
+		if not root or not humanoid then break end
+		tryDoubleJump(bot, root, humanoid, data)
+		local enemy, distance = getNearestEnemy(bot, data.arena)
+		if not enemy then
+			playIdle(data)
+			task.wait(waitAmt)
+			continue
+		end
+
+		local enemyRoot = getRoot(enemy)
+		local desired = chooseSafeMove(bot, root, enemyRoot, data)
+		if desired then
+			humanoid:MoveTo(desired)
+			tryJumpForMovement(bot, root, humanoid, desired, data)
+		else
+			humanoid:Move(Vector3.zero)
+			playIdle(data)
+		end
+
+		local faceTarget = Vector3.new(enemyRoot.Position.X, root.Position.Y, enemyRoot.Position.Z)
+		if data.bodyGyro and data.bodyGyro.Parent then
+			data.bodyGyro.CFrame = CFrame.new(root.Position, faceTarget)
+		end
+
+		if distance <= attackDistance
+			and os.clock() >= data.nextShootAt
+			and data.rng:NextNumber() < 0.82 then
+			local aim = getTargetFloor(enemy, bot)
+			if aim then
+				aim += Vector3.new(data.rng:NextNumber(-2.5, 2.5), 0, data.rng:NextNumber(-2.5, 2.5))
+				if ShootModule.BotFire(bot, aim) then
+					data.nextShootAt = os.clock() + shotCD
+					playShoot(data)
+				end
+			end
+		end
+
+		task.wait(waitAmt + data.rng:NextNumber(0, 0.12))
+	end
+end
+
+function BotService:SpawnForRound(spawnPoints, usedSpawns)
+	local needed = math.clamp(minBots - #Players:GetPlayers(), 0, maxBots)
+	for index = 1, needed do
+		local rng = Random.new(os.clock() * 1000 + index)
+		local bot = ServerStorage:WaitForChild("BotTemplate"):Clone()
+		bot.Name = "Spleef Bot " .. index
+		bot.HumanoidRootPart.DisplayGUI.NameText.Text = "Spleef Bot " .. index
+		bot:SetAttribute("IsBot", true)
+		bot:SetAttribute("Locked", true)
+
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(0, math.huge, 0)
+		bg.CFrame = CFrame.new(bot.HumanoidRootPart.Position)
+		bg.Parent = bot.HumanoidRootPart
+
+		local spawn = chooseSpawn(spawnPoints, usedSpawns, rng)
+		bot:PivotTo(spawn.CFrame * CFrame.new(0, 3, 0))
+		bot.Parent = MainArena.aliveFolder
+		local highlight = Instance.new("Highlight")
+		highlight.Name = "GameHL"
+		highlight.FillTransparency = 1
+		highlight.OutlineTransparency = 0.5
+		highlight.OutlineColor = Color3.new(1, 1, 1)
+		highlight.Parent = bot
+		local root = getRoot(bot)
+		if root then root:SetNetworkOwner(nil) end
+		equipLazerGun(bot)
+
+		local data = {
+			alive = true,
+			arena = MainArena,
+			isRoundBot = true,
+			rng = rng,
+			doubleJumpReady = true,
+			nextJumpAt = 0,
+			nextShootAt = 0,
+			animationState = nil,
+			animationToken = 0,
+			idleTrack = nil,
+			shootTrack = nil,
+			bodyGyro = bg,
+		}
+		bots[bot] = data
+		if MainArena.killField and MainArena.killField:IsA("BasePart") then
+			local humanoid = getHumanoid(bot)
+			data.killConnection = MainArena.killField.Touched:Connect(function(hit)
+				if hit:IsDescendantOf(bot) and humanoid and humanoid.Health > 0 then
+					humanoid.Health = 0
+				end
+			end)
+		end
+		configureBot(bot, data)
+	end
+end
+
+function BotService:SpawnTestBot(spawnPoints, usedSpawns)
+	local index = #TestArena.aliveFolder:GetChildren() + 1
+	local rng = Random.new(os.clock() * 1000 + index)
+	local bot = ServerStorage:WaitForChild("BotTemplate"):Clone()
+	bot.Name = "Test Bot " .. index
+	bot.HumanoidRootPart.DisplayGUI.NameText.Text = "Test Bot " .. index
+	bot:SetAttribute("IsBot", true)
+	bot:SetAttribute("Locked", false)
+
+	local bg = Instance.new("BodyGyro")
+	bg.MaxTorque = Vector3.new(0, math.huge, 0)
+	bg.CFrame = CFrame.new(bot.HumanoidRootPart.Position)
+	bg.Parent = bot.HumanoidRootPart
+
+	local spawn = chooseSpawn(spawnPoints, usedSpawns, rng)
+	bot:PivotTo(spawn.CFrame * CFrame.new(0, 3, 0))
+	bot.Parent = TestArena.aliveFolder
+	local root = getRoot(bot)
+	if root then root:SetNetworkOwner(nil) end
+	equipLazerGun(bot)
+
+	local data = {
+		alive = true,
+		arena = TestArena,
+		isRoundBot = false,
+		rng = rng,
+		doubleJumpReady = true,
+		nextJumpAt = 0,
+		nextShootAt = 0,
+		animationState = nil,
+		animationToken = 0,
+		idleTrack = nil,
+		shootTrack = nil,
+		bodyGyro = bg,
+	}
+	bots[bot] = data
+	if TestArena.killField and TestArena.killField:IsA("BasePart") then
+		local humanoid = getHumanoid(bot)
+		data.killConnection = TestArena.killField.Touched:Connect(function(hit)
+			if hit:IsDescendantOf(bot) and humanoid and humanoid.Health > 0 then
+				humanoid.Health = 0
+			end
+		end)
+	end
+	configureBot(bot, data)
+	task.spawn(runBrain, bot, data)
+	return bot
+end
+
+function BotService:SpawnTestBots(spawnPoints, usedSpawns, minimumCompetitors)
+	local minimum = minimumCompetitors or minBots
+	local needed = math.clamp(minimum - #TestArena.aliveFolder:GetChildren(), 0, maxBots)
+	local spawned = {}
+	for _ = 1, needed do
+		table.insert(spawned, self:SpawnTestBot(spawnPoints, usedSpawns))
+	end
+	return spawned
+end
+
+function BotService:UnlockRoundBots()
+	for bot, data in bots do
+		if data.isRoundBot and data.alive and isAlive(bot, data.arena) then
+			bot:SetAttribute("Locked", false)
+			task.spawn(runBrain, bot, data)
+		end
+	end
+end
+
+function BotService:EndRound()
+	local roundBots = {}
+	for bot, data in bots do
+		if data.isRoundBot then
+			table.insert(roundBots, bot)
+		end
+	end
+	for _, bot in roundBots do
+		local data = bots[bot]
+		if data then data.alive = false end
+		destroyBot(bot)
+	end
+end
+
+function BotService:EndTestBots()
+	local testBots = {}
+	for bot, data in bots do
+		if not data.isRoundBot then
+			table.insert(testBots, bot)
+		end
+	end
+	for _, bot in testBots do
+		local data = bots[bot]
+		if data then data.alive = false end
+		destroyBot(bot)
+	end
+end
+
+return BotService
