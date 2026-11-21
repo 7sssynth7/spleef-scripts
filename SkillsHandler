@@ -1,262 +1,221 @@
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local ServerRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("ServerRemote")
-local ReplicateRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Replicate")
-local SkillSets = require(ReplicatedStorage:WaitForChild("SkillSets"))
-
-local AvailabilityChecks = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("AvailablitiyChecks"))
-local CooldownManager = require(ServerScriptService:WaitForChild("Modules"):WaitForChild("CooldownManager"))
-
-local LoadedModules = {}
-
-local function FindSkillModule(key)
-	if LoadedModules[key] then
-		return LoadedModules[key]
-	end
-
-	local folder = ServerScriptService:WaitForChild("Skills"):FindFirstChild(key)
-	local serverModule = folder and folder:FindFirstChild("ServerModule")
-	if serverModule and serverModule:IsA("ModuleScript") then
-		LoadedModules[key] = require(serverModule)
-		return LoadedModules[key]
-	end
-
-	warn("[SkillsHandler] no ServerModule for:", key)
-	return nil
-end
-
-local function Validate(player, param, extra)
-	local character = player.Character
-	if not character then
-		return false, "no character"
-	end
-	
-	if param.Key == "WaterGun" and param.Function == "Target" then
-		return true
-	end
-
-	if not extra or extra.state ~= "Begin" then
-		return true
-	end
-
-	if AvailabilityChecks.Check(character) then
-		return false, "availability check failed"
-	end
-	if CooldownManager:IsOnCooldown(player, param.Key) then
-		return false, "on cooldown"
-	end
-	if character:GetAttribute("Locked") then
-		return false, "Locked"
-	end
-	if character:GetAttribute("Stunned") then
-		return false, "Stunned"
-	end
-	if character:GetAttribute("Frozen") then
-		return false, "Frozen"
-	end
-
-	local equipped = character:GetAttribute("EquippedWeapon")
-	if equipped ~= param.Key then
-		return false, "weapon not equipped"
-	end
-
-	local binds = SkillSets.WeaponBinds[equipped]
-	if not binds then
-		return false, "no binds for weapon"
-	end
-
-	for _, data in pairs(binds) do
-		if data.Key == param.Key then
-			return true
-		end
-	end
-
-	return false, "skill not valid for weapon"
-end
-
-ServerRemote.OnServerEvent:Connect(function(player, param, extra)
-	if typeof(param) ~= "table" or typeof(param.Key) ~= "string" or typeof(param.Function) ~= "string" then
-		return
-	end
-
-	local ok, reason = Validate(player, param, extra)
-	if not ok then
-		warn("[SkillsHandler] Rejected", param.Key, "from", player.Name, "—", reason)
-		return
-	end
-
-	local skillModule = FindSkillModule(param.Key)
-	local func = skillModule and skillModule[param.Function]
-	if typeof(func) == "function" then
-		func(player, extra or {}, ReplicateRemote)
-	end
-end)
-
-
--------------------------- CooldownManager --------------------------
-(ModuleScript, ServerScriptService.Modules)
+-- Discord: synth._ | Roblox: FNFmaster111
+--!strict
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local Workspace = game:GetService("Workspace")
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local serverRemote, replicate = remotes:WaitForChild("ServerRemote") :: RemoteEvent, remotes:WaitForChild("Replicate") :: RemoteEvent
+local modules = ServerScriptService:WaitForChild("Modules")
+local Availability = require(modules:WaitForChild("AvailablitiyChecks")) :: {Check: (Model?) -> boolean}
+local Cooldowns = require(modules:WaitForChild("CooldownManager"))
+local SkillSets = require(ReplicatedStorage:WaitForChild("SkillSets")) :: {
+	WeaponBinds: {[string]: {[any]: {Key: string}}},
+}
+type Extra = {[string]: any} -- sanitize checks these values before the skill uses them
+type SkillFunction = (Player, Extra, RemoteEvent) -> ()
+type SkillModule = {[string]: SkillFunction}
+type Session = {character: Model, arena: Instance, expires: number}
+type Bucket = {tokens: number, updated: number}
+local loaded: {[string]: SkillModule} = {}
+local buckets: {[Player]: Bucket} = {}
+local sessions: {[Player]: {[string]: Session}} = {}
+local publicActions: {[string]: {[string]: boolean}} = {
+	LazerGun = {Active = true},
+	WaterGun = {Active = true, Target = true}, -- Target needs an active WaterGun session
+}
 
-local ReplicateRemote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Replicate")
-
-local CooldownManager = {}
-CooldownManager.PlayerCooldowns = {}
-
-local function getCharacter(Player)
-	return Player:IsA("Player") and Player.Character or nil
+for key in publicActions do
+	local folder = ServerScriptService:WaitForChild("Skills"):WaitForChild(key)
+	local instance = folder:WaitForChild("ServerModule")
+	assert(instance:IsA("ModuleScript"), key .. " needs a ServerModule")
+	loaded[key] = require(instance) :: SkillModule
 end
 
-local function getMultiplier(character)
-	return (character and character:GetAttribute("CooldownMultiplier")) or 1
+local function finite(value: number): boolean
+	return value == value and math.abs(value) < math.huge
 end
 
+local function vectorIsSafe(value: Vector3): boolean
+	return finite(value.X) and finite(value.Y) and finite(value.Z) and value.Magnitude <= 1000000
+end
 
-local function getTable(Player)
-	if not CooldownManager.PlayerCooldowns[Player] then
-		CooldownManager.PlayerCooldowns[Player] = {}
+local function sanitize(value: unknown): Extra?
+	if typeof(value) ~= "table" then
+		return nil
 	end
-	return CooldownManager.PlayerCooldowns[Player]
+	local result: Extra = {}
+	local count = 0
+	local input = value :: {[any]: any}
+	for key, item in input do
+		count += 1
+		if count > 16 or typeof(key) ~= "string" or #key > 40 then
+			return nil -- limit how much data one request can send
+		end
+		local kind = typeof(item)
+		if kind == "number" and finite(item) then
+			result[key] = item
+		elseif kind == "string" and #item <= 128 then
+			result[key] = item
+		elseif kind == "boolean" then
+			result[key] = item
+		elseif kind == "Vector3" and vectorIsSafe(item) then
+			result[key] = item
+		elseif kind == "CFrame" then
+			for _, component in {item:GetComponents()} do
+				if not finite(component) then
+					return nil
+				end
+			end
+			if not vectorIsSafe(item.Position) then
+				return nil
+			end
+			result[key] = item
+		elseif kind == "Instance" and key == "target" and item:IsA("Model") then
+			result[key] = item -- check the target arena and distance below
+		else
+			return nil -- reject values the weapon does not need
+		end
+	end
+	return result
 end
 
-function CooldownManager:IsOnCooldown(Player, key)
-	local t = getTable(Player)
-	local data = t[key]
-	if not data then return false end
-
-	if tick() >= data.EndTime then
-		t[key] = nil
-		ReplicateRemote:FireClient(Player, {Key = key, Function = "StopCooldown"})
+local function consume(player: Player, now: number): boolean
+	local bucket = buckets[player]
+	if not bucket then
+		bucket = {tokens = 12, updated = now}
+		buckets[player] = bucket
+	end
+	bucket.tokens = math.min(12, bucket.tokens + (now - bucket.updated) * 8)
+	bucket.updated = now
+	if bucket.tokens < 1 then
 		return false
 	end
-
+	bucket.tokens -= 1 -- invalid requests also use a token so they cannot bypass the rate limit
 	return true
 end
 
-function CooldownManager:GetRemaining(Player, key)
-	local t    = getTable(Player)
-	local data = t[key]
-	if not data then return 0 end
-
-	local remaining = data.EndTime - tick()
-	if remaining <= 0 then
-		t[key] = nil
-		ReplicateRemote:FireClient(Player, {Key = key, Function = "StopCooldown"})
-		return 0
+local function arenaOf(character: Model): Instance?
+	local main = Workspace:FindFirstChild("Alive")
+	if main and character.Parent == main then
+		return main
 	end
-
-	return remaining
+	local test = Workspace:FindFirstChild("Test")
+	local practice = if test then test:FindFirstChild("Alive") else nil
+	return if practice and character.Parent == practice then practice else nil
 end
 
-function CooldownManager:Start(Player, key, baseCooldown)
-	local char = getCharacter(Player)
-	local multiplier = getMultiplier(char)
-	local total = math.max(baseCooldown * multiplier, 0.001)
-	local t = getTable(Player)
-
-	t[key] = {
-		Key = key,
-		StartTime = tick(),
-		BaseCooldown = baseCooldown,
-		Multiplier = multiplier,
-		EndTime = tick() + total,
-	}
-
-	ReplicateRemote:FireClient(Player, {
-		Key = key,
-		Function = "StartCooldown",
-		EndTime = t[key].EndTime,
-		Duration = total,
-	})
-
-	return total
-end
-
-function CooldownManager:Stop(Player, key)
-	local t = getTable(Player)
-	t[key] = nil
-	ReplicateRemote:FireClient(Player, {Key = key, Function = "StopCooldown"})
-end
-
-function CooldownManager:ReduceRemaining(Player, key, amount)
-	local t = getTable(Player)
-	local data = t[key]
-	if not data then return end
-
-	data.EndTime = math.max(tick(), data.EndTime - amount)
-	if data.EndTime <= tick() then
-		t[key] = nil
-		ReplicateRemote:FireClient(Player, {Key = key, Function = "StopCooldown"})
-		return
-	end
-
-	ReplicateRemote:FireClient(Player, {
-		Key = key,
-		Function = "UpdateCooldown",
-		EndTime = data.EndTime,
-		Duration = math.max(0, data.EndTime - tick()),
-	})
-end
-
-function CooldownManager:SetMultiplier(Player, value)
-	local character = getCharacter(Player)
-	if not character then return end
-	character:SetAttribute("CooldownMultiplier", value)
-	local t = getTable(Player)
-	local newMult = value
-	for key, data in pairs(t) do
-		local oldTotal = data.BaseCooldown * data.Multiplier
-		local elapsed = tick() - data.StartTime
-		local progress = math.clamp(elapsed / math.max(oldTotal, 0.001), 0, 1)
-		local newTotal = math.max(data.BaseCooldown * newMult, 0.001)
-		local newRemaining = newTotal * (1 - progress)
-		if newRemaining <= 0 then
-			t[key] = nil
-			ReplicateRemote:FireClient(Player, {Key = key, Function = "StopCooldown"})
-		else
-			data.Multiplier = newMult
-			data.EndTime    = tick() + newRemaining
-			ReplicateRemote:FireClient(Player, {
-				Key = key,
-				Function = "UpdateCooldown",
-				EndTime = data.EndTime,
-				Duration = newRemaining,
-			})
+local function hasBind(weapon: string): boolean
+	local binds = SkillSets.WeaponBinds[weapon]
+	if binds then
+		for _, bind in binds do
+			if bind.Key == weapon then
+				return true -- the equipped weapon must have a matching skill bind
+			end
 		end
 	end
-end
-
-function CooldownManager:ClearPlayer(Player)
-	CooldownManager.PlayerCooldowns[Player] = nil
-end
-
-Players.PlayerRemoving:Connect(function(Player)
-	CooldownManager:ClearPlayer(Player)
-end)
-
-return CooldownManager
-
-
-------------------------- AvailabilityChecks ------------------------
-(ModuleScript, ServerScriptService.Modules)
-
-local module = {}
-
-module.Check = function(character)
-	local checks = {
-		Stunned = character:GetAttribute("Stunned") == true,
-		SkillDebounce = character:GetAttribute("SkillDebounce") == true,
-		UsingSkill = character:GetAttribute("UsingSkill") == true,
-		Locked = character:GetAttribute("Locked") == true,
-	}
-
-	for _, blocked in pairs(checks) do
-		if blocked then return true end
-	end
-
 	return false
 end
 
-return module
+local function validTarget(character: Model, target: unknown, arena: Instance): boolean
+	if typeof(target) ~= "Instance" or not target:IsA("Model") or target == character or target.Parent ~= arena then
+		return false
+	end
+	local root, targetRoot = character:FindFirstChild("HumanoidRootPart"), target:FindFirstChild("HumanoidRootPart")
+	local humanoid = target:FindFirstChildOfClass("Humanoid")
+	return root ~= nil and root:IsA("BasePart") and targetRoot ~= nil and targetRoot:IsA("BasePart")
+		and humanoid ~= nil and humanoid.Health > 0 and (targetRoot.Position - root.Position).Magnitude <= 150
+end
+
+serverRemote.OnServerEvent:Connect(function(player: Player, envelope: unknown, rawExtra: unknown): ()
+	local now = os.clock()
+	if not consume(player, now) or typeof(envelope) ~= "table" then
+		return
+	end
+	local request = envelope :: {[string]: unknown}
+	local key, action = request.Key, request.Function
+	if typeof(key) ~= "string" or typeof(action) ~= "string" then
+		return
+	end
+	if #key > 32 or #action > 32 then
+		return
+	end
+	local actions = publicActions[key]
+	if not actions or not actions[action] then
+		return
+	end
+	local extra = sanitize(rawExtra)
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	if not extra or not character or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	local arena = arenaOf(character)
+	if not arena or character:GetAttribute("EquippedWeapon") ~= key or not hasBind(key) then
+		return -- Target and End still need the same equipped weapon and a valid arena
+	end
+	for _, attribute in {"Locked", "Frozen", "Stunned", "SkillDebounce"} do
+		if character:GetAttribute(attribute) == true then
+			return
+		end
+	end
+	local bucket = sessions[player]
+	if not bucket then
+		bucket = {}
+		sessions[player] = bucket
+	end
+	local continuation = action == "Target" or (key == "LazerGun" and extra.state == "End")
+	if continuation then
+		local session = bucket[key]
+		if not session or session.character ~= character or session.arena ~= arena or now >= session.expires then
+			bucket[key] = nil
+			return
+		end
+		if action == "Target" and not validTarget(character, extra.target, arena) then
+			return -- an invalid target does not use up the targeting window
+		end
+		bucket[key] = nil -- consume the session first so duplicate requests cannot run it again
+	else
+		if action ~= "Active" or extra.state ~= "Begin" or Availability.Check(character) or Cooldowns:IsOnCooldown(player, key) then
+			return
+		end
+		local existing = bucket[key]
+		if existing and existing.character == character and existing.expires > now then
+			return
+		end
+		bucket[key] = {character = character, arena = arena, expires = now + (if key == "WaterGun" then 5 else 15)}
+	end
+	local callback = loaded[key][action]
+	if typeof(callback) ~= "function" then
+		bucket[key] = nil
+		return
+	end
+	local ok, reason = pcall(function(): nil
+		callback(player, extra, replicate)
+		return nil
+	end)
+	if not ok then
+		bucket[key] = nil
+		warn("Weapon action failed:", key, action, reason)
+	end -- weapon modules start their own cooldowns
+end)
+
+local characterConnections: {[Player]: RBXScriptConnection} = {}
+local function trackPlayer(player: Player): ()
+	characterConnections[player] = player.CharacterRemoving:Connect(function(_character: Model): ()
+		sessions[player] = nil -- old skill requests cannot carry over to the next character
+	end)
+end
+Players.PlayerAdded:Connect(trackPlayer)
+Players.PlayerRemoving:Connect(function(player: Player): ()
+	sessions[player], buckets[player] = nil, nil
+	local connection = characterConnections[player]
+	if connection then
+		connection:Disconnect()
+		characterConnections[player] = nil
+	end
+end)
+for _, player in Players:GetPlayers() do
+	trackPlayer(player)
+end
