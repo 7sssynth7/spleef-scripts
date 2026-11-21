@@ -1,632 +1,434 @@
-local ts = game:GetService("TweenService")
-local Shatterbox = require(game.ReplicatedStorage.Modules.Shatterbox.Main)
+-- Discord: synth._ | Roblox: FNFmaster111
+--!strict
+
+-- Shatterbox by azavier123 (azavier-a): https://github.com/azavier-a/Shatterbox
+
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+type Stop = () -> ()
+type Scope = {active: boolean, cleaners: {Stop}}
+type Hitbox = {
+	Size: Vector3, CFrame: CFrame, OnVoxelDestruct: string, CleanupDelay: number, FilterTagged: string,
+	Destroy: (Hitbox) -> (), DestroyHitbox: (Hitbox) -> (),
+}
+export type Event = {Name: string, Fn: (number?) -> Stop}
+local Shatterbox = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Shatterbox"):WaitForChild("Main"))
+	:: {CreateHitbox: () -> Hitbox}
+local assets = ReplicatedStorage:WaitForChild("Assets")
+local fxAssets, sounds = assets:WaitForChild("Fx"), assets:WaitForChild("Sfx")
+local alive, map, fx = Workspace:WaitForChild("Alive"), Workspace:WaitForChild("Map"), Workspace:WaitForChild("Fx")
+local rng = Random.new()
+local EventsModule = {}
 
+local function stop(scope: Scope): ()
+	if not scope.active then
+		return -- cleanup can be called more than once
+	end
+	scope.active = false -- stop callbacks before destroying their objects
+	for index = #scope.cleaners, 1, -1 do
+		local ok, reason = pcall(function(): nil
+			scope.cleaners[index]()
+			return nil
+		end)
+		if not ok then
+			warn("Hazard cleanup failed:", reason) -- keep cleaning up if one resource fails
+		end
+	end
+	table.clear(scope.cleaners)
+end
 
-local function getSpawnPoints(MeteorSpawns)
-	local points = {}
-	for _, v in ipairs(MeteorSpawns:GetDescendants()) do
-		if v.Name == "MeteorSpawn" and v:IsA("BasePart") then
-			table.insert(points, v)
+local function own(scope: Scope, instance: Instance): ()
+	table.insert(scope.cleaners, function(): ()
+		instance:Destroy()
+	end)
+end
+
+local function run(scope: Scope, duration: number, step: (number, number) -> ()): Stop
+	local elapsed = 0
+	local updating = false
+	local connection = RunService.Heartbeat:Connect(function(dt: number): ()
+		if not scope.active then
+			return
+		end
+		elapsed += dt
+		if elapsed >= duration then
+			stop(scope)
+			return
+		end
+		if updating then
+			return -- wait for the current update if a dependency yields
+		end
+		updating = true
+		local ok, reason = pcall(function(): nil
+			step(dt, elapsed)
+			return nil
+		end)
+		updating = false
+		if not ok then
+			warn("Hazard stopped after an update error:", reason)
+			stop(scope) -- remove the hazard if its update fails
+		end
+	end)
+	table.insert(scope.cleaners, function(): ()
+		connection:Disconnect()
+	end)
+	return function(): ()
+		stop(scope)
+	end
+end
+
+local function liveRoot(character: Instance): (BasePart?, Humanoid?)
+	if not character:IsA("Model") then
+		return nil, nil
+	end
+	local root, humanoid = character:FindFirstChild("HumanoidRootPart"), character:FindFirstChildOfClass("Humanoid")
+	if root and root:IsA("BasePart") and humanoid and humanoid.Health > 0 then
+		return root, humanoid
+	end
+	return nil, nil
+end
+
+local function emit(instance: Instance): ()
+	for _, child in instance:GetDescendants() do
+		if child:IsA("ParticleEmitter") then
+			local count = child:GetAttribute("EmitCount")
+			child:Emit(if typeof(count) == "number" then math.clamp(count, 0, 1000) else 15)
+		end
+	end
+end
+
+local function playSound(name: string, parent: Instance): ()
+	local template = sounds:FindFirstChild(name)
+	if template and template:IsA("Sound") then
+		local sound = template:Clone()
+		sound.Parent = parent -- spatial sound needs a part or attachment
+		sound:Play()
+		Debris:AddItem(sound, 10) -- TimeLength can still be zero while the sound loads
+	end
+end
+
+local function impact(scope: Scope, position: Vector3, lightning: boolean): ()
+	if not scope.active then
+		return
+	end
+	local hitbox = Shatterbox.CreateHitbox()
+	hitbox.Size, hitbox.CFrame = Vector3.one * 10, CFrame.new(position)
+	hitbox.OnVoxelDestruct, hitbox.CleanupDelay = "Destroy", -1
+	hitbox.FilterTagged = "RoundDestroyable" -- only destroy tagged parts from this round
+	hitbox:Destroy() -- Destroy runs the cut, DestroyHitbox cleans up the hitbox
+	task.delay(0.1, function(): ()
+		hitbox:DestroyHitbox() -- give the queued cut time before cleanup
+	end)
+	if not scope.active then
+		return -- the round may have ended while destruction yielded
+	end
+	local overlap = OverlapParams.new()
+	overlap.FilterType, overlap.FilterDescendantsInstances = Enum.RaycastFilterType.Include, {map}
+	for _, part in Workspace:GetPartBoundsInRadius(position, 10, overlap) do
+		if (part:IsA("UnionOperation") or part:IsA("MeshPart")) and part:GetAttribute("Destroyable") == true then
+			part:Destroy() -- both unions and meshes must have Destroyable set
+		end
+	end
+	for _, character in alive:GetChildren() do
+		local root = liveRoot(character)
+		if root and not root.Anchored then
+			local offset = root.Position - position
+			local radius = if lightning then 9 else 11
+			if offset.Magnitude <= radius then
+				local direction = if offset.Magnitude > 0.1 then offset.Unit else Vector3.yAxis
+				root:ApplyImpulse((direction + Vector3.yAxis * 0.3).Unit * root.AssemblyMass * (if lightning then 40 else 50))
+			end
+		end
+	end
+	local anchor = Instance.new("Part")
+	anchor.Name, anchor.Size, anchor.CFrame = "HazardImpact", Vector3.one, CFrame.new(position)
+	anchor.Anchored, anchor.CanCollide, anchor.CanTouch, anchor.CanQuery = true, false, false, false
+	anchor.Transparency, anchor.Parent = 1, fx
+	own(scope, anchor)
+	local template = if lightning then fxAssets:FindFirstChild("ThunderStrikeModel") else nil
+	if not lightning then
+		local explosions = fxAssets:FindFirstChild("Explosions")
+		local default = if explosions then explosions:FindFirstChild("Default") else nil
+		template = if default then default:FindFirstChild("Attachment") else nil
+	end
+	if template then
+		local effect = template:Clone()
+		if effect:IsA("Model") then
+			effect:PivotTo(CFrame.new(position + Vector3.yAxis * 55))
+		elseif effect:IsA("BasePart") then
+			effect.CFrame = CFrame.new(position)
+		end
+		effect.Parent = anchor
+		emit(effect) -- the attachment gets its world position from the anchor
+	end
+	playSound(if lightning then "ThunderStrike" else "MeteorImpact", anchor)
+	Debris:AddItem(anchor, 5)
+end
+
+local function weatherPoints(): {Vector3}
+	local points: {Vector3} = {}
+	local folder = fxAssets:FindFirstChild("MeteorSpawns")
+	if folder then
+		for _, child in folder:GetDescendants() do
+			if child:IsA("BasePart") and child.Name == "MeteorSpawn" then
+				table.insert(points, child.Position) -- read the markers without cloning the whole folder
+			end
 		end
 	end
 	return points
 end
 
-local function filterValidSpawns(spawnPoints, raycastParams)
-	local valid = {}
-	for _, sp in ipairs(spawnPoints) do
-		local result = workspace:Raycast(sp.Position, Vector3.new(0, -500, 0), raycastParams)
-		if result then
-			table.insert(valid, sp)
-		else
-			warn("Spawn over void, skipping: ", sp:GetFullName())
-		end
-	end
-	return valid
+local function mapRays(): RaycastParams
+	local params = RaycastParams.new()
+	params.FilterType, params.FilterDescendantsInstances = Enum.RaycastFilterType.Include, {map}
+	params.RespectCanCollide = true -- noncollidable parts cannot count as a landing surface
+	return params
 end
 
-local function DestroyNearbyUnions(hitPosition, radius)
-	for _, part in ipairs(workspace:GetPartBoundsInRadius(hitPosition, radius)) do
-		if part:IsA("UnionOperation") or part:IsA("MeshPart") and part:GetAttribute("Destroyable") then
-			part:Destroy()
+local function startWeather(lightning: boolean, duration: number): Stop
+	local scope: Scope = {active = true, cleaners = {}}
+	local points, rays = weatherPoints(), mapRays()
+	type Meteor = {model: Model, indicator: BasePart, position: Vector3, speed: number, age: number}
+	local meteors: {Meteor} = {}
+	table.insert(scope.cleaners, function(): ()
+		for _, meteor in meteors do
+			meteor.model:Destroy()
+			meteor.indicator:Destroy()
 		end
-	end
-end
-
-local function normExp(hitpos)
-	local hb = Shatterbox.CreateHitbox()
-	hb.Size = Vector3.one * 10
-	hb.OnVoxelDestruct = "Destroy"
-	hb.CleanupDelay = -1
-	hb.CFrame = CFrame.new(hitpos)
-	task.delay(.1, function()
-		hb:DestroyHitbox()
+		table.clear(meteors)
 	end)
-
-	hb:Destroy()
-end
-
-local function DoMeteorExplosion(hitPosition, hitpart: Part)
-	local explosionRadius = 10
-	normExp(hitPosition)
-
-	DestroyNearbyUnions(hitPosition, explosionRadius)
-
-	task.spawn(function()
-		local kbRadius, kb = 11, 50
-		for _, p in workspace:GetDescendants() do
-			if p:IsA("Model") and p:FindFirstChild("Humanoid") then
-				local pChar = p
-				if not pChar then continue end
-				local hrp = pChar:FindFirstChild("HumanoidRootPart")
-				if not hrp then continue end
-				if (hrp.Position - hitPosition).Magnitude > kbRadius then continue end
-
-				local knockDir = (hrp.Position - hitPosition)
-				knockDir = knockDir.Magnitude > 0.1 and knockDir.Unit or Vector3.new(0, 1, 0)
-
-				local existing = hrp:FindFirstChild("KnockbackVel")
-				if existing then existing:Destroy() end
-
-				local att = hrp:FindFirstChild("KnockbackAtt") or Instance.new("Attachment")
-				att.Name = "KnockbackAtt"
-				att.Parent = hrp
-
-				local linVel = Instance.new("LinearVelocity")
-				linVel.Name = "KnockbackVel"
-				linVel.Attachment0 = att
-				linVel.VectorVelocity = knockDir * kb
-				linVel.MaxForce = math.huge
-				linVel.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-				linVel.RelativeTo = Enum.ActuatorRelativeTo.World
-				linVel.Parent = hrp
-				game.Debris:AddItem(linVel, 0.15)
-			end
-		end
-	end)
-
-	local vfxExplode = game.ReplicatedStorage.Assets.Fx.Explosions.Default.Attachment:Clone()
-	vfxExplode.Parent = workspace.Fx
-	vfxExplode.Position = hitPosition
-	task.spawn(function()
-		wait()
-		for _, v in pairs(vfxExplode:GetDescendants()) do
-			if v:IsA("ParticleEmitter") then
-				v:Emit(v:GetAttribute("EmitCount"))
-			end
-		end
-	end)
-	game.Debris:AddItem(vfxExplode, 2)
-
-	local sfx = game.ReplicatedStorage.Assets.Sfx.MeteorImpact:Clone()
-	sfx.Parent = vfxExplode
-	sfx:Play()
-	game.Debris:AddItem(sfx, sfx.TimeLength)
-end
-
-
-local function shootMeteor(activeMeteors, validSpawns, raycastParams)
-	local MetIndicator = game.ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Fx"):WaitForChild("Indicator")
-	local Meteor = game.ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Fx"):WaitForChild("Meteor")
-
-	local warningTime = 3
-	local spinSpeed = 180
-	local indicatorMaxSize = 14
-	local fallSpeed = 50
-
-	local chosen = validSpawns[math.random(1, #validSpawns)]
-	local spawnPos = chosen.Position
-
-	local floorResult = workspace:Raycast(spawnPos, Vector3.new(0, -500, 0), raycastParams)
-	if not floorResult then
-		warn("Valid spawn lost its floor mid-event, skipping shot: ", chosen:GetFullName())
-		return
-	end
-	local landPos = floorResult.Position
-	local totalDist = spawnPos.Y - landPos.Y
-	fallSpeed = totalDist / warningTime
-
-	local indicator = MetIndicator:Clone()
-	indicator.Anchored = true
-	indicator.Size = Vector3.new(0.3, indicatorMaxSize, indicatorMaxSize)
-	indicator.CFrame = CFrame.new(landPos.X, landPos.Y + 0.5, landPos.Z) * CFrame.Angles(0, 0, math.rad(90))
-	indicator.Parent = workspace.Fx
-
-	local meteorClone = Meteor:Clone()
-	meteorClone:PivotTo(CFrame.new(spawnPos))
-	meteorClone.Parent = workspace.Fx
-
-	local meteorFallSFX = game.ReplicatedStorage.Assets.Sfx.MeteorFall:Clone()
-	meteorFallSFX.Parent = meteorClone.PrimaryPart
-	meteorFallSFX:Play()
-
-	for _, part in ipairs(meteorClone:GetDescendants()) do
-		if part:IsA("BasePart") then part.Anchored = true end
-	end
-
-	local function tweenMeteorTo(targetPos)
-		local currentPos = meteorClone.PrimaryPart.Position
-		local dist = currentPos.Y - targetPos.Y
-		local duration = math.max(0.1, dist / fallSpeed)
-		local delta = targetPos - currentPos
-		for _, part in ipairs(meteorClone:GetDescendants()) do
-			if part:IsA("BasePart") then
-				ts:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
-					Position = part.Position + delta
-				}):Play()
-			end
-		end
-	end
-
-	tweenMeteorTo(landPos)
-
-	local currentTarget = landPos
-	local done = false
-	local checkTimer = 0
-	local spinConnection
-	local cleanup
-
-	cleanup = function()
-		if done then return end
-		done = true
-		if spinConnection then spinConnection:Disconnect() end
-		if indicator then indicator:Destroy() end
-		if meteorClone then meteorClone:Destroy() end
-		if meteorFallSFX then meteorFallSFX:Destroy() end
-		if activeMeteors then activeMeteors[cleanup] = nil end
-	end
-	if activeMeteors then activeMeteors[cleanup] = true end
-
-	spinConnection = RunService.Heartbeat:Connect(function(dt)
-		if done then return end
-
-		for _, part in ipairs(meteorClone:GetDescendants()) do
-			if part:IsA("BasePart") then
-				part.CFrame = part.CFrame * CFrame.Angles(
-					math.rad(spinSpeed * dt),
-					math.rad(spinSpeed * dt * 0.7),
-					math.rad(spinSpeed * dt * 0.3)
-				)
-			end
-		end
-
-		checkTimer += dt
-		if checkTimer < 0.1 then return end
-		checkTimer = 0
-
-		local meteorPos = meteorClone.PrimaryPart.Position
-		local rayOrigin = meteorPos + Vector3.new(0, 2, 0)
-		local result = workspace:Raycast(rayOrigin, Vector3.new(0, -500, 0), raycastParams)
-
-		if not result then
-			print("destroy! (no floor)")
-			cleanup()
-			return
-		end
-
-		local newLandPos = result.Position
-		local distToFloor = meteorPos.Y - newLandPos.Y
-
-		if distToFloor <= 3 then
-			DoMeteorExplosion(meteorClone.PrimaryPart.Position, result.Instance)
-			cleanup()
-			return
-		end
-
-		if (newLandPos - currentTarget).Magnitude > 2 then
-			currentTarget = newLandPos
-			tweenMeteorTo(newLandPos)
-		end
-
-		local sizeRatio = math.clamp(distToFloor / totalDist, 0, 1)
-		local newSize = indicatorMaxSize * sizeRatio
-		indicator.CFrame = CFrame.new(newLandPos.X, newLandPos.Y + 0.5, newLandPos.Z) * CFrame.Angles(0, 0, math.rad(90))
-		indicator.Size = Vector3.new(0.3, newSize, newSize)
-	end)
-
-	task.delay(warningTime + 2, cleanup)
-end
-
-local function StartMeteorRain(dur)
-	local running = true
-	local startTime = os.clock()
-	local activeMeteors = {}
-
-	local MeteorSpawns = game.ReplicatedStorage.Assets.Fx.MeteorSpawns:Clone()
-	MeteorSpawns.Parent = workspace.Map
-
-	local raycastParams = RaycastParams.new()
-	raycastParams.FilterDescendantsInstances = {workspace.Fx, workspace.Alive}
-	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-
-	local allSpawns = getSpawnPoints(MeteorSpawns)
-	local validSpawns = filterValidSpawns(allSpawns, raycastParams)
-
-	if #validSpawns == 0 then
-		warn("No valid meteor spawns found, skipping Meteor Shower")
-		MeteorSpawns:Destroy()
-		return function() end
-	end
-
-	task.spawn(function()
-		while running and os.clock() - startTime < dur do
-			shootMeteor(activeMeteors, validSpawns, raycastParams)
-			task.wait(5)
-		end
-	end)
-
-	return function()
-		running = false
-		for cleanupFn in pairs(activeMeteors) do
-			cleanupFn()
-		end
-		MeteorSpawns:Destroy()
-	end
-end
-
-local function DoLightningStrike(hitPosition, hitpart: BasePart)
-	local explosionRadius = 10
-	normExp(hitPosition)
-
-	DestroyNearbyUnions(hitPosition, explosionRadius)
-
-	task.spawn(function()
-		local kbRadius, kb = 9, 40
-		for _, p in workspace:GetDescendants() do
-			if p:IsA("Model") and p:FindFirstChild("Humanoid") then
-				local pChar = p
-				if not pChar then continue end
-				local hrp = pChar:FindFirstChild("HumanoidRootPart")
-				if not hrp then continue end
-				if (hrp.Position - hitPosition).Magnitude > kbRadius then continue end
-
-				local knockDir = (hrp.Position - hitPosition)
-				knockDir = knockDir.Magnitude > 0.1 and knockDir.Unit or Vector3.new(0, 1, 0)
-
-				local existing = hrp:FindFirstChild("KnockbackVel")
-				if existing then existing:Destroy() end
-
-				local att = hrp:FindFirstChild("KnockbackAtt") or Instance.new("Attachment")
-				att.Name = "KnockbackAtt"
-				att.Parent = hrp
-
-				local linVel = Instance.new("LinearVelocity")
-				linVel.Name = "KnockbackVel"
-				linVel.Attachment0 = att
-				linVel.VectorVelocity = knockDir * kb
-				linVel.MaxForce = math.huge
-				linVel.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-				linVel.RelativeTo = Enum.ActuatorRelativeTo.World
-				linVel.Parent = hrp
-				game.Debris:AddItem(linVel, 0.15)
-			end
-		end
-	end)
-	
-	local vfxStrike = game.ReplicatedStorage.Assets.Fx.ThunderStrikeModel:Clone()
-	vfxStrike.Parent = workspace.Fx
-	vfxStrike:PivotTo(CFrame.new(hitPosition) * CFrame.new(0, 55, 0))
-	task.spawn(function()
-		wait()
-		for _, v in pairs(vfxStrike:GetDescendants()) do
-			if v:IsA("ParticleEmitter") then
-				v:Emit(v:GetAttribute("EmitCount"))
-			end
-		end
-	end)
-	game.Debris:AddItem(vfxStrike, 5)
-
-	local sfx = game.ReplicatedStorage.Assets.Sfx.ThunderStrike:Clone()
-	sfx.Parent = vfxStrike
-	sfx:Play()
-	game.Debris:AddItem(sfx, sfx.TimeLength)
-end
-
-local function shootLightning(activeStrikes, validSpawns, raycastParams)
-	local chosen = validSpawns[math.random(1, #validSpawns)]
-	local spawnPos = chosen.Position
-
-	local floorResult = workspace:Raycast(spawnPos, Vector3.new(0, -500, 0), raycastParams)
-	if not floorResult then
-		warn("Valid spawn lost its floor mid-event, skipping strike: ", chosen:GetFullName())
-		return
-	end
-	local landPos = floorResult.Position
-	local dist = spawnPos.Y - landPos.Y
-
-	local bolt = game.ReplicatedStorage.Assets.Fx.LightningBolt:Clone()
-	bolt.Anchored = true
-	bolt.CanCollide = false
-	bolt.Size = Vector3.new(dist, bolt.Size.Y, bolt.Size.Z)
-	bolt.CFrame = CFrame.new(landPos.X, landPos.Y + (dist / 2), landPos.Z) * CFrame.Angles(0, 0, math.rad(90))
-	bolt.Parent = workspace.Fx
-	bolt.Transparency = 1
-
-	local thunderSFX = game.ReplicatedStorage.Assets.Sfx.ThunderStrike:Clone()
-	thunderSFX.Parent = bolt
-	thunderSFX:Play()
-
-	DoLightningStrike(landPos, floorResult.Instance)
-
-	local done = false
-	local cleanup
-	cleanup = function()
-		if done then return end
-		done = true
-		if bolt then bolt:Destroy() end
-		if activeStrikes then activeStrikes[cleanup] = nil end
-	end
-	if activeStrikes then activeStrikes[cleanup] = true end
-
-	game.Debris:AddItem(thunderSFX, thunderSFX.TimeLength)
-	task.delay(0.4, cleanup)
-end
-
-local function StartDescendingLava(risingLava, duration)
-	local ti = TweenInfo.new(duration, Enum.EasingStyle.Linear)
-	local lava = risingLava:Clone()
-	lava.Anchored = true
-	lava.Parent = workspace.Fx
-
-	lava.Size = Vector3.new(lava.Size.X, 132, lava.Size.Z)
-	lava.Position = Vector3.new(lava.Position.X, 3, lava.Position.Z)
-	local tween = ts:Create(lava, ti, {
-		Size = Vector3.new(lava.Size.X, 12, lava.Size.Z),
-		Position = Vector3.new(lava.Position.X, -62, lava.Position.Z)
-	})
-	tween:Play()
-
-	return lava, tween
-end
-
-local function StartThunderstorm(dur)
-	local running = true
-	local startTime = os.clock()
-	local activeStrikes = {}
-
-	local MeteorSpawns = game.ReplicatedStorage.Assets.Fx.MeteorSpawns:Clone()
-	MeteorSpawns.Parent = workspace.Map
-
-	local raycastParams = RaycastParams.new()
-	raycastParams.FilterDescendantsInstances = {workspace.Fx, workspace.Alive}
-	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-
-	local allSpawns = getSpawnPoints(MeteorSpawns)
-	local validSpawns = filterValidSpawns(allSpawns, raycastParams)
-
-	if #validSpawns == 0 then
-		warn("No valid lightning spawns found, skipping Thunderstorm")
-		MeteorSpawns:Destroy()
-		return function() end
-	end
-
-	task.spawn(function()
-		while running and os.clock() - startTime < dur do
-			shootLightning(activeStrikes, validSpawns, raycastParams)
-			task.wait(2)
-		end
-	end)
-
-	return function()
-		running = false
-		for cleanupFn in pairs(activeStrikes) do
-			cleanupFn()
-		end
-		MeteorSpawns:Destroy()
-	end
-end
-
-local module = {}
-module.Events = {
-	{Name = "Lava Drain", Fn = function()
-		print("lava drain event chosen!")
-
-		local risingLava = game.ReplicatedStorage.Assets.Fx.RISINGLAVA
-		local lava, tween = StartDescendingLava(risingLava, 150)
-
-		for _, c in pairs(workspace.Alive:GetChildren()) do
-			if c:IsA("Model") and c:FindFirstChild("Humanoid") then
-				if game.Players:GetPlayerFromCharacter(c) then
-					local plr = game.Players:GetPlayerFromCharacter(c)
-					game.ReplicatedStorage.Remotes.RS:FireClient(plr, "RisingLava")
+	local sinceShot, sinceProbe = 10, 0
+	return run(scope, duration, function(dt: number, elapsed: number): ()
+		sinceShot += dt
+		if #points > 0 and sinceShot >= (if lightning then 2 else 5) then
+			sinceShot = 0
+			local origin = points[rng:NextInteger(1, #points)]
+			local floor = Workspace:Raycast(origin, -Vector3.yAxis * 500, rays)
+			if floor and lightning then
+				impact(scope, floor.Position, true)
+				if not scope.active then return end
+				local bolt = fxAssets:FindFirstChild("LightningBolt")
+				if bolt and bolt:IsA("BasePart") then
+					local clone = bolt:Clone()
+					local height = (origin - floor.Position).Magnitude
+					clone.Size = Vector3.new(height, clone.Size.Y, clone.Size.Z)
+					clone.CFrame = CFrame.new((origin + floor.Position) * 0.5) * CFrame.Angles(0, 0, math.pi / 2)
+					clone.Anchored, clone.CanCollide, clone.CanQuery, clone.Parent = true, false, false, fx
+					Debris:AddItem(clone, 0.4)
 				end
-			end
-		end
-
-		return function()
-			if tween then tween:Cancel() end
-			if lava then lava:Destroy() end
-		end
-	end},
-
-	{Name = "Meteor Shower", Fn = function()
-		print("meteor shower event chosen!")
-		return StartMeteorRain(150)
-	end},
-
-	{Name = "Thunderstorm", Fn = function()
-		print("thunderstorm event chosen!")
-		return StartThunderstorm(150)
-	end},
-	
-	{Name = "None", Fn = function()
-		print("None event chosen!")
-	end},
-
-	{Name = "Windstorm", Fn = function()
-		print("windstorm event chosen!")
-
-		local dirs = {"Left", "Right", "Front", "Back"}
-		local active = true
-		local currentDirName = nil
-		local currentDirPart = nil
-		local oldWindFX = nil
-		local pushDirection = Vector3.new(0, 0, 0)
-		
-		local windPushingSFX = game.ReplicatedStorage.Assets.Sfx.WindPushing:Clone()
-		windPushingSFX.Parent = workspace.sounds
-		windPushingSFX:Play()
-		game.Debris:AddItem(windPushingSFX, 150)
-		
-		local dirVectors = {
-			Front = Vector3.new(0, 0, -1),
-			Back = Vector3.new(0, 0, 1),
-			Left = Vector3.new(-1, 0, 0),
-			Right = Vector3.new(1, 0, 0),
-		}
-		
-		local function pickDir()
-			local randDir
-			repeat
-				randDir = dirs[math.random(1, #dirs)]
-			until randDir ~= currentDirName
-			currentDirName = randDir
-
-			local template = game.ReplicatedStorage.Assets.Fx:FindFirstChild("WindRel"..string.sub(randDir, 1, 1))
-			if not template then warn("Missing wind asset for dir: "..randDir) return end
-
-			if currentDirPart then
-				currentDirPart:Destroy()
-			end
-
-			local clone = template:Clone()
-			clone.Anchored = true
-			clone.CanCollide = false
-			clone.Parent = workspace.Fx
-			currentDirPart = clone
-			
-			if oldWindFX then
-				oldWindFX:Destroy()
-				oldWindFX = nil
-			end
-			
-			local newWindFX = game.ReplicatedStorage.Assets.Fx.WindFX:Clone()
-			newWindFX.Parent = workspace.Fx
-			newWindFX.CFrame = clone.CFrame * CFrame.new(0,0,-50)
-			game:GetService("CollectionService"):AddTag(newWindFX, "Indestructible")
-			
-			oldWindFX = newWindFX
-
-			pushDirection = dirVectors[randDir]
-		end
-
-		pickDir()
-
-		local dirLoop = task.spawn(function()
-			while active do
-				task.wait(5)
-				if active then pickDir() end
-			end
-		end)
-
-		local forceLoop = task.spawn(function()
-			while active do
-				for _, char in pairs(workspace.Alive:GetChildren()) do
-					if char:IsA("Model") then
-						local hum = char:FindFirstChildOfClass("Humanoid")
-						local hrp = char:FindFirstChild("HumanoidRootPart")
-						if hum and hrp and hum.Health > 0 then
-							local vf = hrp:FindFirstChild("WindForce")
-							if hum.FloorMaterial ~= Enum.Material.Air then
-								if not vf then
-									local att = hrp:FindFirstChild("WindAtt") or Instance.new("Attachment")
-									att.Name = "WindAtt"
-									att.Parent = hrp
-									vf = Instance.new("VectorForce")
-									vf.Name = "WindForce"
-									vf.Attachment0 = att
-									vf.RelativeTo = Enum.ActuatorRelativeTo.World
-									vf.Parent = hrp
-								end
-								if workspace.Map:FindFirstChildWhichIsA("Model").Name == "Ice Arena" then
-									vf.Force = pushDirection * hrp.AssemblyMass * 75
-								else
-									vf.Force = pushDirection * hrp.AssemblyMass * 200
-								end
-							elseif vf then
-								vf:Destroy()
-							end
+			elseif floor then
+				local meteorTemplate, indicatorTemplate = fxAssets:FindFirstChild("Meteor"), fxAssets:FindFirstChild("Indicator")
+				if meteorTemplate and meteorTemplate:IsA("Model") and indicatorTemplate and indicatorTemplate:IsA("BasePart") then
+					local model, indicator = meteorTemplate:Clone(), indicatorTemplate:Clone()
+					for _, part in model:GetDescendants() do
+						if part:IsA("BasePart") then
+							part.Anchored, part.CanCollide, part.CanQuery = true, false, false
 						end
 					end
+					model:PivotTo(CFrame.new(origin))
+					model.Parent = fx
+					indicator.Anchored, indicator.CanCollide, indicator.CanQuery, indicator.Parent = true, false, false, fx
+					indicator.CFrame = CFrame.new(floor.Position + Vector3.yAxis * 0.5) * CFrame.Angles(0, 0, math.pi / 2)
+					indicator.Size = Vector3.new(0.3, 14, 14)
+					local primary = model.PrimaryPart
+					if primary then
+						playSound("MeteorFall", primary)
+					end
+					table.insert(meteors, {model = model, indicator = indicator, position = origin,
+						speed = math.max(10, (origin.Y - floor.Position.Y) / 3), age = 0})
 				end
-				task.wait(0.1)
 			end
+		end
+		sinceProbe += dt
+		if sinceProbe < 0.1 then
+			return -- limit the warning and floor checks to ten updates per second
+		end
+		local step = sinceProbe
+		sinceProbe = 0
+		for index = #meteors, 1, -1 do
+			local meteor = meteors[index]
+			local travel = meteor.speed * step
+			local hit = Workspace:Raycast(meteor.position, -Vector3.yAxis * (travel + 2), rays)
+			meteor.age += step
+			if hit or meteor.age > 12 or meteor.model.Parent == nil then
+				if hit then
+					impact(scope, hit.Position, false) -- check the full travel distance so lag cannot skip the floor
+					if not scope.active then return end
+				end
+				meteor.model:Destroy()
+				meteor.indicator:Destroy()
+				table.remove(meteors, index)
+			else
+				meteor.position -= Vector3.yAxis * travel
+				meteor.model:PivotTo(CFrame.new(meteor.position) * CFrame.Angles(elapsed * 3, elapsed * 2, elapsed))
+				local floor = Workspace:Raycast(meteor.position, -Vector3.yAxis * 500, rays)
+				if floor then
+					meteor.indicator.CFrame = CFrame.new(floor.Position + Vector3.yAxis * 0.5) * CFrame.Angles(0, 0, math.pi / 2)
+					local size = math.max(0.2, 14 * math.clamp((meteor.position.Y - floor.Position.Y) / (meteor.speed * 3), 0, 1))
+					meteor.indicator.Size = Vector3.new(0.3, size, size)
+				else
+					meteor.model:Destroy()
+					meteor.indicator:Destroy()
+					table.remove(meteors, index) -- remove the warning if its floor is gone
+				end
+			end
+		end
+	end)
+end
+
+local function lavaHazard(duration: number, draining: boolean): Stop
+	local scope: Scope = {active = true, cleaners = {}}
+	local template = fxAssets:WaitForChild("RISINGLAVA")
+	assert(template:IsA("BasePart"), "RISINGLAVA must be a BasePart")
+	local lava = template:Clone()
+	lava.Anchored, lava.CanCollide, lava.CanQuery = true, false, false
+	local targetSize, targetPosition = Vector3.new(723.2, 182.25, 459.7), Vector3.new(130.8, 22.075, -351.05)
+	local bottom = targetPosition.Y - targetSize.Y * 0.5
+	lava.Size = if draining then Vector3.new(targetSize.X, 132, targetSize.Z) else Vector3.new(targetSize.X, 0.1, targetSize.Z)
+	lava.Position = if draining then Vector3.new(targetPosition.X, bottom + 66, targetPosition.Z)
+		else Vector3.new(targetPosition.X, bottom + 0.05, targetPosition.Z)
+	lava.Parent = fx
+	own(scope, lava)
+	local goal = if draining then {Size = Vector3.new(targetSize.X, 0.1, targetSize.Z), Position = Vector3.new(targetPosition.X, bottom, targetPosition.Z)}
+		else {Size = targetSize, Position = targetPosition}
+	local tween = TweenService:Create(lava, TweenInfo.new(duration, Enum.EasingStyle.Linear), goal)
+	tween:Play()
+	table.insert(scope.cleaners, function(): ()
+		tween:Cancel() -- cancel the tween before destroying the lava
+	end)
+	local timer = 0
+	return run(scope, duration, function(dt: number, _elapsed: number): ()
+		timer += dt
+		if timer < 0.1 then
+			return
+		end
+		timer = 0
+		for _, character in alive:GetChildren() do
+			local root, humanoid = liveRoot(character)
+			if root and humanoid then
+				local point = lava.CFrame:PointToObjectSpace(root.Position) -- local coordinates make the check match the lava volume
+				local half = lava.Size * 0.5
+				if math.abs(point.X) <= half.X and math.abs(point.Z) <= half.Z and point.Y <= half.Y and point.Y >= -half.Y then
+					humanoid.Health = 0 -- growing lava can miss touch events, so check it on the server
+				end
+			end
+		end
+	end)
+end
+
+local function windstorm(duration: number): Stop
+	local scope: Scope = {active = true, cleaners = {}}
+	type Wind = {force: VectorForce, attachment: Attachment}
+	local forces: {[BasePart]: Wind} = {}
+	table.insert(scope.cleaners, function(): ()
+		fx:SetAttribute("WindDirection", nil)
+	end)
+	table.insert(scope.cleaners, function(): ()
+		for _, entry in forces do
+			entry.force:Destroy()
+			entry.attachment:Destroy() -- also clean attachments from fighters who already left Alive
+		end
+		table.clear(forces)
+	end)
+	local direction, directionIndex, timer = Vector3.xAxis, 0, 5
+	local directions = {Vector3.xAxis, -Vector3.xAxis, Vector3.zAxis, -Vector3.zAxis}
+	local accumulator = 0
+	return run(scope, duration, function(dt: number, _elapsed: number): ()
+		timer += dt
+		if timer >= 5 then
+			timer = 0
+			directionIndex = (directionIndex + rng:NextInteger(1, 3) - 1) % 4 + 1 -- pick one of the other three directions
+			direction = directions[directionIndex]
+			fx:SetAttribute("WindDirection", direction) -- clients can use this direction for wind effects
+		end
+		accumulator += dt
+		if accumulator < 0.1 then
+			return
+		end
+		accumulator = 0
+		local present: {[BasePart]: boolean} = {}
+		for _, character in alive:GetChildren() do
+			local root, humanoid = liveRoot(character)
+			if root and humanoid and not root.Anchored and humanoid.FloorMaterial ~= Enum.Material.Air then
+				present[root] = true
+				local entry = forces[root]
+				if not entry then
+					local attachment, force = Instance.new("Attachment"), Instance.new("VectorForce")
+					attachment.Parent = root
+					force.Attachment0, force.RelativeTo, force.ApplyAtCenterOfMass = attachment, Enum.ActuatorRelativeTo.World, true
+					force.Parent = root
+					entry = {force = force, attachment = attachment}
+					forces[root] = entry
+				end
+				local currentMap = map:FindFirstChildWhichIsA("Model")
+				local acceleration = if currentMap and currentMap.Name == "Ice Arena" then 75 else 200
+				entry.force.Force = direction * root.AssemblyMass * acceleration -- mass scaling gives different rigs the same acceleration
+			end
+		end
+		for root, entry in forces do
+			if not present[root] then
+				entry.force:Destroy()
+				entry.attachment:Destroy()
+				forces[root] = nil
+			end
+		end
+	end)
+end
+
+local function iceGround(duration: number): Stop
+	local scope: Scope = {active = true, cleaners = {}}
+	type Original = {material: Enum.Material, physics: PhysicalProperties?}
+	local originals: {[BasePart]: Original} = {}
+	local function apply(instance: Instance): ()
+		if not instance:IsA("BasePart") or originals[instance] then
+			return
+		end
+		originals[instance] = {material = instance.Material, physics = instance.CustomPhysicalProperties}
+		local physics = instance.CurrentPhysicalProperties
+		instance.Material = Enum.Material.Ice
+		instance.CustomPhysicalProperties = PhysicalProperties.new(physics.Density, 0, physics.Elasticity, 100, physics.ElasticityWeight)
+	end
+	table.insert(scope.cleaners, function(): ()
+		for part, original in originals do
+			if part.Parent then
+				part.Material = original.material
+				local writable = part :: any -- nil restores default physics but the generated type leaves it out
+				writable.CustomPhysicalProperties = original.physics
+			end
+		end
+		table.clear(originals)
+	end)
+	local containers: {Instance} = {map}
+	local debris = Workspace:FindFirstChild("Debris")
+	if debris then
+		table.insert(containers, debris)
+	end
+	for _, container in containers do
+		for _, child in container:GetDescendants() do
+			apply(child)
+		end
+		local connection = container.DescendantAdded:Connect(apply) -- apply ice when new debris is added instead of scanning it again
+		table.insert(scope.cleaners, function(): ()
+			connection:Disconnect()
 		end)
+	end
+	return run(scope, duration, function(_dt: number, _elapsed: number): () end)
+end
 
-		return function()
-			active = false
-			if currentDirPart then currentDirPart:Destroy() end
-			for _, char in pairs(workspace.Alive:GetChildren()) do
-				local hrp = char:FindFirstChild("HumanoidRootPart")
-				if hrp then
-					local vf = hrp:FindFirstChild("WindForce")
-					if vf then vf:Destroy() end
-					local att = hrp:FindFirstChild("WindAtt")
-					if att then att:Destroy() end
-				end
-			end
-			
-			if windPushingSFX then windPushingSFX:Destroy() end
-			if oldWindFX then oldWindFX:Destroy() end
-		end
-	end},
+function EventsModule.StartRisingLava(duration: number): Stop
+	return lavaHazard(duration, false)
+end
 
-	{Name = "Ice Ground", Fn = function()
-		print("Ice Ground event chosen!")
+EventsModule.Events = {
+	{Name = "Lava Drain", Fn = function(duration: number?): Stop return lavaHazard(duration or 150, true) end},
+	{Name = "Meteor Shower", Fn = function(duration: number?): Stop return startWeather(false, duration or 150) end},
+	{Name = "Thunderstorm", Fn = function(duration: number?): Stop return startWeather(true, duration or 150) end},
+	{Name = "None", Fn = function(_duration: number?): Stop return function(): () end end},
+	{Name = "Windstorm", Fn = function(duration: number?): Stop return windstorm(duration or 150) end},
+	{Name = "Ice Ground", Fn = function(duration: number?): Stop return iceGround(duration or 150) end},
+} :: {Event}
 
-		local active = true
-
-		local function applyIce(part)
-			if not part:IsA("BasePart") then return end
-			part.Material = Enum.Material.Ice
-			local existing = part.CustomPhysicalProperties
-			part.CustomPhysicalProperties = PhysicalProperties.new(
-				existing and existing.Density or part.CurrentPhysicalProperties.Density,
-				0,
-				existing and existing.Elasticity or part.CurrentPhysicalProperties.Elasticity,
-				75,
-				existing and existing.ElasticityWeight or part.CurrentPhysicalProperties.ElasticityWeight
-			)
-		end
-
-		local currMap = workspace.Map:FindFirstChildWhichIsA("Model")
-
-		local function sweep()
-			if currMap then
-				for _, part in pairs(currMap:GetDescendants()) do
-					applyIce(part)
-				end
-			end
-			for _, part in pairs(workspace.Debris:GetChildren()) do
-				applyIce(part)
-				for _, d in pairs(part:GetDescendants()) do
-					applyIce(d)
-				end
-			end
-		end
-
-		sweep()
-
-		local cons = {}
-		if currMap then
-			table.insert(cons, currMap.DescendantAdded:Connect(applyIce))
-		end
-		table.insert(cons, workspace.Debris.DescendantAdded:Connect(applyIce))
-
-		task.spawn(function()
-			while active do
-				task.wait(1)
-				if active then sweep() end
-			end
-		end)
-
-		return function()
-			active = false
-			for _, c in pairs(cons) do
-				c:Disconnect()
-			end
-		end
-	end},
-}
-return module
+return EventsModule
