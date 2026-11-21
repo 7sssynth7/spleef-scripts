@@ -1,969 +1,615 @@
-local MapVoteModule = require(script.Parent.MapVoteController)
-local AliveFolder = game.Workspace:WaitForChild("Alive")
-local DeadFolder = game.Workspace:WaitForChild("Dead")
+-- Discord: synth._ | Roblox: FNFmaster111
+--!strict
 
-local MusicRemote = game.ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Music")
-
-local rewardStatsModule = require(game.ServerScriptService.Modules.RewardStats)
-local skinInfo = require(game.ReplicatedStorage.Modules.SkinsInfo)
-
-local risingLava = game.ReplicatedStorage.Assets.Fx.RISINGLAVA
-
-local eventsModule = require(game.ServerScriptService.Modules.EventsModule)
-local BotService = require(game.ServerScriptService.Modules.BotService)
-
-local ss = game:GetService("SoundService")
 local Players = game:GetService("Players")
-local LobbyMusic = ss.LobbyMusic
+local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local CollectionService = game:GetService("CollectionService")
+local SoundService = game:GetService("SoundService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+local modules = ServerScriptService:WaitForChild("Modules")
+local moduleFolder = script.Parent
+assert(moduleFolder, "RoundModule must have a parent")
+local MapVote = require(moduleFolder:WaitForChild("MapVoteController"))
+local BotService = require(modules:WaitForChild("BotService"))
+local Events = require(modules:WaitForChild("EventsModule"))
+local Cooldowns = require(modules:WaitForChild("CooldownManager"))
+local Rewards = require(modules:WaitForChild("RewardStats")) :: {
+	GiveExp: (Player, number) -> (), GiveWin: (Player, number) -> (), GiveCash: (Player, number) -> (),
+	CalcLoseExp: (Player) -> number, CalcWinExp: (Player) -> number,
+}
+local Skins = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SkinsInfo")) :: {
+	Skins: {[string]: {Icon: string}},
+}
+local alive, dead = Workspace:WaitForChild("Alive"), Workspace:WaitForChild("Dead")
+local mapFolder, fxFolder = Workspace:WaitForChild("Map"), Workspace:WaitForChild("Fx")
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local music, roundRemote = remotes:WaitForChild("Music") :: RemoteEvent, remotes:WaitForChild("RS") :: RemoteEvent
+local weapons, assets = ServerStorage:WaitForChild("Weapons"), ReplicatedStorage:WaitForChild("Assets")
+type Phase = "Idle" | "Voting" | "Preparing" | "Active" | "Ending"
+type Snapshot = {Kills: number, Cash: number, Exp: number, TotalExp: number, Level: number}
+type Entrant = {character: Model, player: Player?, humanoid: Humanoid, root: BasePart, alive: boolean, awardedExp: number}
+type Stop = () -> ()
+local phase: Phase = "Idle"
+local function currentPhase(): Phase
+	return phase -- read the current phase because callbacks can change it
+end
+local generation = 0
+local contestants: {[Model]: Entrant} = {}
+local connections: {RBXScriptConnection} = {}
+local rng = Random.new()
+local Round = {
+	IntermissionTime = 20, RoundTime = 150, VoteTime = 10,
+	RoundWinner = nil :: (Player | Model)?, RoundActive = false, CanVote = false,
+	StatsInfo = {} :: {[string]: Snapshot}, ActiveEventStop = nil :: Stop?, ActiveLavaStop = nil :: Stop?,
+}
 
-local remotes = game.ReplicatedStorage.Remotes
+local function rootOf(character: Model): BasePart?
+	local root = character:FindFirstChild("HumanoidRootPart")
+	return if root and root:IsA("BasePart") then root else nil
+end
 
-local ts = game:GetService("TweenService")
+local function descendant(parent: Instance?, path: {string}): Instance?
+	local current = parent
+	for _, name in path do
+		current = if current then current:FindFirstChild(name) else nil
+	end
+	return current
+end
 
-local LavaTargetSize = Vector3.new(723.2, 182.25, 459.7)
-local LavaTargetPos = Vector3.new(130.8, 22.075, -351.05)
-local LavaBottomY = LavaTargetPos.Y - (LavaTargetSize.Y / 2)
+local function ui(player: Player, path: {string}): Instance?
+	return descendant(player:FindFirstChildOfClass("PlayerGui"), path)
+end
 
-local suffixes = {"K", "M", "B", "T", "Qd", "Qn", "Sx", "Sp", "Oc", "No", "Dc"}
+local function text(instance: Instance?, value: string): ()
+	if instance and instance:IsA("TextLabel") then
+		instance.Text = value
+	elseif instance and instance:IsA("TextButton") then
+		instance.Text = value
+	end
+end
 
-local function format(n)
-	if n < 1000 then return tostring(n) end
-	for i = #suffixes, 1, -1 do
-		local threshold = 10 ^ (i * 3)
-		if n >= threshold then
-			local val = n / threshold
-			local str = string.format(val < 10 and "%.2f" or val < 100 and "%.1f" or "%.0f", val)
-			return str .. suffixes[i]
+local function visible(instance: Instance?, value: boolean): ()
+	if instance and instance:IsA("GuiObject") then
+		instance.Visible = value
+	end
+end
+
+local function notice(value: string): ()
+	for _, player in Players:GetPlayers() do
+		visible(ui(player, {"PlayerUIs", "NotisBg"}), true)
+		text(ui(player, {"PlayerUIs", "NotisBg", "bg", "NoticeText"}), value)
+	end
+end
+
+local function numberAt(player: Player, path: {string}): number
+	local instance = descendant(player, path)
+	if instance and instance:IsA("IntValue") then
+		return instance.Value
+	elseif instance and instance:IsA("NumberValue") then
+		return instance.Value
+	end
+	return 0
+end
+
+local function snapshot(player: Player): Snapshot
+	return {
+		Kills = numberAt(player, {"leaderstats", "Kills"}), Cash = numberAt(player, {"leaderstats", "Cash"}),
+		Exp = numberAt(player, {"Config", "Exp"}), TotalExp = numberAt(player, {"Config", "MaxExp"}),
+		Level = numberAt(player, {"Config", "Level"}),
+	}
+end
+
+local function inPractice(character: Model): boolean
+	local practice = descendant(Workspace, {"Test", "Alive"})
+	return practice ~= nil and character:IsDescendantOf(practice)
+end
+
+local function disconnectAll(): ()
+	for _, connection in connections do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+end
+
+local function giveExperience(entry: Entrant, amount: number): ()
+	local player = entry.player
+	if player and player.Parent == Players then
+		Rewards.GiveExp(player, amount)
+		entry.awardedExp += amount -- track the XP actually given so level-ups do not change the result
+	end
+end
+
+local function killFeed(character: Model): ()
+	local template = script:FindFirstChild("FeedTemplate")
+	if not template then
+		return
+	end
+	for _, player in Players:GetPlayers() do
+		local container = ui(player, {"KillFeed", "FeedBg"})
+		if container then
+			local clone = template:Clone()
+			text(clone:FindFirstChild("TextLabel"), character.Name .. " died to " .. tostring(character:GetAttribute("Died") or "Void") .. "!")
+			clone.Parent = container
+			Debris:AddItem(clone, 3)
 		end
 	end
 end
 
-local function isLobbyPlayer(player)
-	local character = player.Character
-	return character and character:IsDescendantOf(DeadFolder)
-end
-
-local function StartRisingLava(duration)
-	local lava = risingLava:Clone()
-	lava.Anchored = true
-	lava.Size = Vector3.new(LavaTargetSize.X, 0, LavaTargetSize.Z)
-	lava.CFrame = CFrame.new(LavaTargetPos.X, LavaBottomY, LavaTargetPos.Z)
-	lava.Parent = workspace.Fx
-
-	local tween = ts:Create(lava, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
-		Size = LavaTargetSize,
-		Position = LavaTargetPos
-	})
-	tween:Play()
-
-	return lava, tween
-end
-
-local function notice(text)
-	for _, player in pairs(Players:GetPlayers()) do
-		pcall(function()
-			player.PlayerGui.PlayerUIs.NotisBg.Visible = true
-			player.PlayerGui.PlayerUIs.NotisBg.bg.NoticeText.Text = text
-		end)
+local function eliminate(entry: Entrant, award: boolean): ()
+	if not entry.alive then
+		return
+	end
+	entry.alive = false -- mark them out first so another signal cannot reward the same death
+	entry.character:SetAttribute("Locked", true)
+	if entry.character.Parent == alive then
+		entry.character.Parent = dead
+	end
+	if award and entry.player and entry.player.Parent == Players then
+		giveExperience(entry, Rewards.CalcLoseExp(entry.player))
+		killFeed(entry.character)
 	end
 end
 
-local function IsCharacterAliveAndValid(char)
-	if not char then return false end
-	if not char.Parent then return false end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if not hum or not hrp then return false end
-	if hum.Health <= 0 then return false end
+local function register(character: Model, player: Player?, token: number): ()
+	local humanoid, root = character:FindFirstChildOfClass("Humanoid"), rootOf(character)
+	if not humanoid or not root or humanoid.Health <= 0 then
+		return
+	end
+	local entry: Entrant = {character = character, player = player, humanoid = humanoid, root = root, alive = true, awardedExp = 0}
+	contestants[character] = entry
+	table.insert(connections, humanoid.Died:Connect(function(): ()
+		if generation == token then
+			eliminate(entry, phase == "Active") -- deaths during the countdown do not give loss XP
+		end
+	end))
+end
+
+local function survivors(): {Entrant}
+	local result: {Entrant} = {}
+	for _, entry in contestants do
+		if entry.alive then
+			if entry.humanoid.Health <= 0 or entry.character.Parent ~= alive or not entry.root.Parent
+				or (entry.player ~= nil and entry.player.Character ~= entry.character) then
+				eliminate(entry, phase == "Active")
+			else
+				table.insert(result, entry)
+			end
+		end
+	end
+	return result -- count living entrants, not every object inside Alive
+end
+
+local function clearWeapons(character: Model): ()
+	for _, child in character:GetChildren() do
+		if child:IsA("Model") and child:GetAttribute("Weapon") == true then
+			child:Destroy()
+		end
+	end
+	character:SetAttribute("EquippedWeapon", nil)
+end
+
+local function applySkin(player: Player, gun: Model): ()
+	local skins = player:FindFirstChild("Skins")
+	if not skins then
+		return
+	end
+	for _, owned in skins:GetChildren() do
+		local activeSkin = owned:FindFirstChild("Active")
+		local info = Skins.Skins[owned.Name]
+		if not activeSkin or not activeSkin:IsA("BoolValue") or not activeSkin.Value or not info or owned.Name == "Default" then
+			continue
+		end
+		local mesh = gun:FindFirstChildWhichIsA("SpecialMesh", true)
+		if mesh then
+			mesh.TextureId = info.Icon
+		else
+			for _, part in gun:GetDescendants() do
+				if part:IsA("BasePart") and part.Transparency < 1 then
+					for _, face in Enum.NormalId:GetEnumItems() do
+						local decal = Instance.new("Decal")
+						decal.Face, decal.Texture, decal.Parent = face, info.Icon, part
+					end
+				end
+			end
+		end
+		local auraTemplate = descendant(assets, {"Fx", "Skins", owned.Name, "Aura"})
+		local point = gun:FindFirstChild("Point")
+		if auraTemplate and auraTemplate:IsA("Model") and point and point:IsA("BasePart") then
+			local aura = auraTemplate:Clone()
+			local primary = aura.PrimaryPart
+			if primary then
+				local size, auraSize = gun:GetExtentsSize(), aura:GetExtentsSize()
+				local scale = math.max(size.X, size.Y, size.Z) / math.max(0.01, auraSize.X, auraSize.Y, auraSize.Z)
+				aura:ScaleTo(scale)
+				aura:PivotTo(point.CFrame)
+				aura.Parent = gun
+				for _, part in aura:GetDescendants() do
+					if part:IsA("BasePart") then
+						part.Anchored, part.CanCollide, part.Massless = false, false, true
+					end
+				end
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0, weld.Part1, weld.Parent = point, primary, primary
+			else
+				aura:Destroy()
+			end
+		end
+		return -- only apply the first active skin so auras cannot stack
+	end
+end
+
+local function equip(player: Player, character: Model, root: BasePart): boolean
+	local chosen, inventory = player:FindFirstChild("ActiveGun"), player:FindFirstChild("Inventory")
+	local arm = character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm")
+	if not chosen or not chosen:IsA("StringValue") or not inventory or not inventory:FindFirstChild(chosen.Value)
+		or not arm or not arm:IsA("BasePart") then
+		return false
+	end
+	local template = weapons:FindFirstChild(chosen.Value)
+	if not template or not template:IsA("Model") then
+		return false
+	end
+	local gun = template:Clone()
+	local primary = gun.PrimaryPart
+	if not primary then
+		gun:Destroy()
+		return false
+	end
+	clearWeapons(character)
+	gun:SetAttribute("Weapon", true)
+	gun:PivotTo(root.CFrame)
+	gun.Parent = character
+	for _, part in gun:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.Anchored, part.CanCollide, part.Massless = false, false, true -- the gun must not anchor the player or add extra mass
+		end
+	end
+	local motor = Instance.new("Motor6D")
+	motor.Name, motor.Part0, motor.Part1 = "WeaponMotor", arm, primary
+	local source = descendant(ServerStorage, {"Motors", chosen.Value})
+	if source and source:IsA("Motor6D") then
+		motor.C0, motor.C1 = source.C0, source.C1
+	end
+	motor.Parent = primary
+	character:SetAttribute("EquippedWeapon", chosen.Value)
+	applySkin(player, gun)
 	return true
 end
 
-local function winnerReference(character)
-	return Players:GetPlayerFromCharacter(character) or character
-end
-
-local function cleanupFolders()
-	for _, deb in pairs(workspace.Debris:GetChildren()) do
-		deb:Destroy()
-	end
-
-	for _, fx in pairs(workspace.Fx:GetChildren()) do
-		fx:Destroy()
-	end
-
-	for _, part in pairs(workspace.Map:GetChildren()) do
-		part:Destroy()
-	end
-
-	remotes.ReplicateBullets:FireAllClients(nil, "Cleanup")
-end
-
-local function EmitWinFX(WinnerChar)
-	if not IsCharacterAliveAndValid(WinnerChar) then return end
-
-	local WinFX = game.ReplicatedStorage.Assets.Fx.WinExp:Clone()
-	WinFX.CFrame = WinnerChar.HumanoidRootPart.CFrame
-	WinFX.Parent = workspace.Fx
-
-	local listOfInstant = {}
-	local listOfDelay = {}
-
-	for _, emitter in pairs(WinFX:GetDescendants()) do
-		if emitter:IsA("ParticleEmitter") then
-			if emitter:GetAttribute("EmitDelay") then
-				table.insert(listOfDelay, emitter)
-			else
-				table.insert(listOfInstant, emitter)
-			end
+local function cleanupMap(): ()
+	local folders: {Instance} = {mapFolder, fxFolder}
+	for _, name in {"Debris", "Bullets"} do
+		local folder = Workspace:FindFirstChild(name)
+		if folder then
+			table.insert(folders, folder)
 		end
 	end
-
-	local closeWorks = game.ReplicatedStorage.Assets.Fx.Fireworks:Clone()
-	closeWorks.Parent = WinnerChar
-
-	local weld = Instance.new("Weld")
-	weld.Part0 = WinnerChar.HumanoidRootPart
-	weld.Part1 = closeWorks.Fireworks
-	weld.Parent = closeWorks.Fireworks
-
-	local weld2 = Instance.new("Weld")
-	weld2.Part0 = WinnerChar.HumanoidRootPart
-	weld2.Part1 = closeWorks.FireworksCopy
-	weld2.Parent = closeWorks.FireworksCopy
-
-	for _, particle in pairs(closeWorks:GetDescendants()) do
-		if particle:IsA("ParticleEmitter") then
-			particle:Emit(particle:GetAttribute("EmitCount"))
-		end
-	end
-
-	local closefireworksfx = game.ReplicatedStorage.Assets.Sfx.Fireworks:Clone()
-	closefireworksfx.Parent = WinnerChar.HumanoidRootPart
-	closefireworksfx.Looped = true
-	closefireworksfx:Play()
-
-	game.Debris:AddItem(closefireworksfx, 3)
-	game.Debris:AddItem(closeWorks, 3)
-
-	for _ = 1, 3 do
-		task.wait(1)
-		if not IsCharacterAliveAndValid(WinnerChar) then break end
-		WinFX.CFrame = WinnerChar.HumanoidRootPart.CFrame
-
-		local shootSFX = game.ReplicatedStorage.Assets.Sfx.FireworkShoot:Clone()
-		shootSFX.Parent = game.SoundService
-		shootSFX.Volume = 2
-		shootSFX:Play()
-		game.Debris:AddItem(shootSFX, shootSFX.TimeLength)
-
-		for _, emitter in listOfInstant do
-			if emitter and emitter.Parent then
-				emitter:Emit(emitter:GetAttribute("EmitCount"))
-			end
-		end
-
-		for _, emitter in listOfDelay do
-			task.delay(emitter:GetAttribute("EmitDelay"), function()
-				if emitter and emitter.Parent then
-					emitter:Emit(emitter:GetAttribute("EmitCount"))
+	for _, folder in folders do
+		if folder then
+			for _, child in folder:GetChildren() do
+				if child:GetAttribute("Arena") ~= "Test" then
+					child:Destroy() -- keep effects marked for the practice arena
 				end
-				local expSFX = game.ReplicatedStorage.Assets.Sfx.FireworkExplode:Clone()
-				expSFX.Parent = game.SoundService
-				expSFX.Volume = 1
-				expSFX:Play()
-				game.Debris:AddItem(expSFX, expSFX.TimeLength)
+			end
+		end
+	end
+	local bulletsRemote = remotes:FindFirstChild("ReplicateBullets")
+	if bulletsRemote and bulletsRemote:IsA("RemoteEvent") then
+		bulletsRemote:FireAllClients(nil, "Cleanup")
+	end
+end
+
+local function reportRewards(entry: Entrant): ()
+	local player = entry.player
+	if not player or player.Parent ~= Players then
+		return
+	end
+	local previous = Round.StatsInfo[player.Name]
+	if not previous then
+		return
+	end
+	local current = snapshot(player)
+	local base = ui(player, {"PlayerUIs", "RewardsBg", "RewardsContainer", "pat"})
+	text(descendant(base, {"KillsTemp", "RewardText"}), "+" .. tostring(math.max(0, current.Kills - previous.Kills)))
+	text(descendant(base, {"CashTemp", "RewardText"}), "+" .. tostring(math.max(0, current.Cash - previous.Cash)))
+	text(descendant(base, {"ExpTemp", "RewardText"}), "+" .. tostring(entry.awardedExp))
+	visible(ui(player, {"PlayerUIs", "RewardsBg"}), true)
+end
+
+local function announceMap(chosen: Model, eventName: string): ()
+	for _, player in Players:GetPlayers() do
+		if player.Character and player.Character.Parent == dead then
+			visible(ui(player, {"PlayerUIs", "NotisBg"}), false)
+			visible(ui(player, {"MapVote", "MapWinBg"}), true)
+			visible(ui(player, {"MapVote", "MapWinBg", "WinnerTemp"}), true)
+			visible(ui(player, {"MapVote", "MapWinBg", "Randbg"}), true)
+			text(ui(player, {"MapVote", "MapWinBg", "WinnerTemp", "MapName"}), chosen.Name)
+			text(ui(player, {"MapVote", "MapWinBg", "Randbg", "RandomEvent"}), eventName)
+			local image = ui(player, {"MapVote", "MapWinBg", "WinnerTemp", "MapImage"})
+			local metadata = chosen.Parent
+			local id = if metadata then metadata:GetAttribute("Image") else nil
+			if image and image:IsA("ImageLabel") and id then
+				image.Image = "rbxassetid://" .. tostring(id)
+			end
+		end
+	end
+end
+
+function Round.ValidVote(): boolean
+	return phase == "Voting" and Round.CanVote
+end
+
+function Round.VoteStart(): Model?
+	MapVote.Start()
+	task.wait(Round.VoteTime)
+	return MapVote.End()
+end
+
+function Round.RoundEnd(): ()
+	if phase ~= "Active" and phase ~= "Preparing" then
+		return
+	end
+	phase, Round.RoundActive = "Ending", false -- mark the round ended before calling code that might yield
+	generation += 1
+	disconnectAll()
+	for _, stopper in {Round.ActiveEventStop, Round.ActiveLavaStop} do
+		if stopper then
+			local ok, reason = pcall(function(): nil
+				stopper()
+				return nil
 			end)
+			if not ok then
+				warn("Round hazard cleanup failed:", reason)
+			end
 		end
 	end
-
-	game.Debris:AddItem(WinFX, 5)
-end
-
-local function killFeed(char, attacker)
-	local feedTemplate = script.FeedTemplate
-	local ti = TweenInfo.new(.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
-
-	for _, plr in game.Players:GetPlayers() do
-		local ui = plr.PlayerGui:FindFirstChild("KillFeed")
-		if not ui then continue end
-		local cont = ui.FeedBg
-
-		local newFeed = feedTemplate:Clone()
-		newFeed.TextLabel.Text = char .. " Died to " .. attacker .. "!"
-
-		newFeed.Parent = cont
-		game.Debris:AddItem(newFeed, 3)
-		newFeed.TextLabel.TextStrokeTransparency = 1
-		newFeed.TextLabel.UIStroke.Transparency = 1
-		newFeed.Skull.ImageTransparency = 1
-
-		ts:Create(newFeed.TextLabel, ti, {TextTransparency = 0}):Play()
-		ts:Create(newFeed.Skull, ti, {ImageTransparency = 0}):Play()
-		ts:Create(newFeed.TextLabel.UIStroke, ti, {Transparency = 0}):Play()
-	end
-end
-
--- puts the player's chosen gun skin (texture + aura) on their gun
-local function applySkin(player, gun)
-	local activeSkin
-	for _, skin in pairs(player.Skins:GetChildren()) do
-		if skin.Active.Value == true then
-			activeSkin = skin
-			break
+	Round.ActiveEventStop, Round.ActiveLavaStop = nil, nil
+	local winner = Round.RoundWinner
+	if winner then
+		notice(winner.Name .. " won the round!")
+		music:FireAllClients("winner")
+		if winner:IsA("Player") and winner.Parent == Players then
+			local character = winner.Character
+			local entry = if character then contestants[character] else nil
+			if entry then
+				Rewards.GiveWin(winner, 1)
+				giveExperience(entry, Rewards.CalcWinExp(winner))
+				Rewards.GiveCash(winner, 500)
+			end
+			local rig = descendant(ServerScriptService, {"Scripts", "PlayWinner", "WonRig"})
+			if rig then
+				rig:SetAttribute("Winner", winner.Name) -- the winner display reads this attribute
+			end
 		end
 	end
-
-	if not activeSkin or activeSkin.Name == "Default" then return end
-
-	local info = skinInfo.Skins[activeSkin.Name]
-	if not info then
-		warn("Skin not found in skininfo: " .. activeSkin.Name)
-		return
-	end
-	local decalID = info.Icon
-
-	local mesh = gun:FindFirstChildWhichIsA("SpecialMesh", true)
-	if mesh then
-		mesh.TextureId = decalID
-	else
-		for _, v in pairs(gun:GetDescendants()) do
-			if v:IsA("BasePart") and v.Transparency ~= 1 then
-				for _, face in {"Front", "Back", "Left", "Right", "Top", "Bottom"} do
-					local decal = Instance.new("Decal", v)
-					decal.Texture = decalID
-					decal.Face = Enum.NormalId[face]
+	local lobbySpawn = Workspace:FindFirstChild("LobbySpawn") or Workspace:FindFirstChildWhichIsA("SpawnLocation")
+	for _, entry in contestants do
+		local player, character = entry.player, entry.character
+		if player and player.Parent == Players then
+			reportRewards(entry)
+			Cooldowns:ClearPlayer(player)
+			roundRemote:FireClient(player, "RoundEnd")
+			if character.Parent and player.Character == character then
+				character.Parent = dead
+				clearWeapons(character)
+				for _, attribute in {"Locked", "UsingSkill", "SkillDebounce", "Stunned", "Frozen", "Slowed"} do
+					character:SetAttribute(attribute, false) -- only reset combat flags so other attributes keep their values
+				end
+				character:SetAttribute("Count", nil)
+				local highlight = character:FindFirstChild("GameHL")
+				if highlight then
+					highlight:Destroy()
+				end
+				entry.root.Anchored = false
+				if lobbySpawn and lobbySpawn:IsA("BasePart") and entry.humanoid.Health > 0 then
+					character:PivotTo(lobbySpawn.CFrame * CFrame.new(0, 3, 0))
+					entry.root.AssemblyLinearVelocity, entry.root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
 				end
 			end
 		end
 	end
+	BotService:EndRound()
+	cleanupMap()
+	table.clear(contestants)
+	table.clear(Round.StatsInfo)
+	if winner then
+		task.wait(5) -- finish showing the result before another round can start
+	end
+	music:FireAllClients("lobby")
+	Round.RoundWinner = nil
+	phase = "Idle"
+end
 
-	local auraFolder = game.ReplicatedStorage.Assets.Fx.Skins:FindFirstChild(activeSkin.Name)
-	if not auraFolder then
-		warn("Gun Aura for: " .. activeSkin.Name .. " not found")
+function Round.RoundStart(chosen: Model): ()
+	if phase ~= "Idle" then
 		return
 	end
-
-	local aura = auraFolder.Aura:Clone() :: Model
-
-	local gunSize = gun:GetExtentsSize()
-	local auraSize = aura:GetExtentsSize()
-	local scale = math.max(gunSize.X, gunSize.Y, gunSize.Z) / math.max(auraSize.X, auraSize.Y, auraSize.Z)
-	aura:ScaleTo(scale)
-
-	aura.PrimaryPart.CFrame = gun.Point.CFrame
-	aura.Parent = gun.Point
-
-	local w = Instance.new("Weld", gun.Point)
-	w.Part0 = gun.Point
-	w.Part1 = aura.PrimaryPart
-end
-
--- clones the player's active gun into their character and welds it to the arm
-local function equipPlayerGun(player, char, hrp, WeaponsFolder)
-	local activeGunVal = player:FindFirstChild("ActiveGun")
-	if not activeGunVal or activeGunVal.Value == "" then return end
-	if not player.Inventory:FindFirstChild(activeGunVal.Value) then return end
-
-	for _, v in char:GetChildren() do
-		if v:IsA("Model") and v:GetAttribute("Weapon") then
-			v:Destroy()
-		end
-	end
-
-	local gunTemplate = WeaponsFolder:FindFirstChild(activeGunVal.Value)
-	if not gunTemplate then
-		warn("Gun not found: " .. activeGunVal.Value)
-		return
-	end
-
-	local chosenGun = gunTemplate:Clone() :: Model
-	chosenGun.Parent = char
-	chosenGun.PrimaryPart.CFrame = hrp.CFrame
-
-	local motor = Instance.new("Motor6D")
-	motor.Name = "WeaponMotor"
-	motor.Part0 = char:FindFirstChild("Right Arm")
-	motor.Part1 = chosenGun.PrimaryPart
-
-	local chosenMotor = WeaponsFolder.Parent.Motors:FindFirstChild(activeGunVal.Value)
-	if chosenMotor then
-		motor.C0 = chosenMotor.C0
-	end
-	motor.Parent = chosenGun.PrimaryPart
-	char:SetAttribute("EquippedWeapon", activeGunVal.Value)
-
-	applySkin(player, chosenGun)
-end
-
-local WeaponsFolder = game.ServerStorage.Weapons
-local module = {}
-module.IntermissionTime = 20
-module.RoundTime = 150
-module.VoteTime = 10
-module.RoundWinner = nil
-module.RoundActive = false
-module.CanVote = false
-
-module.StatsInfo = {}
-module.ActiveEventStop = nil
-module.ActiveLava = nil
-module.ActiveLavaTween = nil
-
-module.VoteStart = function()
-	MapVoteModule.Start()
-	task.wait(module.VoteTime)
-	return MapVoteModule.End()
-end
-
-module.ValidVote = function()
-	return module.CanVote
-end
-
--- slot machine style text that slows down and lands on the chosen event
-local function cycleEventText(label, events, chosenEvent)
-	local ticks = 20
-	for i = 1, ticks do
-		label.Text = events[math.random(1, #events)].Name
-		local progress = i / ticks
-		task.wait(0.04 + (progress ^ 3) * 0.45)
-	end
-	label.Text = chosenEvent.Name
-end
-
-local function tweenEventBg(randBg, events, chosenEvent)
-	local ti = TweenInfo.new(.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
-
-	randBg.Visible = true
-	randBg.Sep.UIGradient.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 1),
-		NumberSequenceKeypoint.new(0.5, 1),
-		NumberSequenceKeypoint.new(1, 1)
-	})
-	randBg.RandomEvent.TextTransparency = 1
-	randBg.RandEventTitle.Transparency = 1
-
-	-- tween a NumberValue so the gradient can follow it
-	local proxy = Instance.new("NumberValue")
-	proxy.Value = 0
-
-	local tween = ts:Create(proxy, ti, {Value = 1})
-	proxy:GetPropertyChangedSignal("Value"):Connect(function()
-		randBg.Sep.UIGradient.Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 1),
-			NumberSequenceKeypoint.new(0.5, proxy.Value),
-			NumberSequenceKeypoint.new(1, 1)
-		})
-	end)
-
-	tween:Play()
-	tween.Completed:Connect(function()
-		proxy:Destroy()
-	end)
-
-	ts:Create(randBg.RandEventTitle, ti, {TextTransparency = 0}):Play()
-	ts:Create(randBg.RandomEvent, ti, {TextTransparency = 0}):Play()
-
-	cycleEventText(randBg.RandomEvent, events, chosenEvent)
-end
-
-local function showMapAndEvent(ChosenMap, chosen, listOfEvents)
-	for _, player in pairs(Players:GetPlayers()) do
-		if not isLobbyPlayer(player) then
-			continue
-		end
-
-		task.spawn(function()
-			player.PlayerGui.PlayerUIs.NotisBg.Visible = false
-
-			local mvGUI = player.PlayerGui.MapVote
-			local MapWinBg = mvGUI.MapWinBg
-			local WinnerTemp = MapWinBg.WinnerTemp
-			local RandBg = MapWinBg.Randbg
-
-			MapWinBg.Visible = true
-			WinnerTemp.Visible = true
-			WinnerTemp.Position = UDim2.fromScale(.5, .5)
-
-			local ogSize = MapWinBg.Size
-			MapWinBg.Size = UDim2.fromScale(.1, .35)
-
-			ts:Create(MapWinBg, TweenInfo.new(.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = ogSize}):Play()
-
-			if ChosenMap.Parent:GetAttribute("Image") then
-				WinnerTemp.MapImage.Image = "rbxassetid://" .. ChosenMap.Parent:GetAttribute("Image")
+	phase = "Preparing"
+	generation += 1
+	local token = generation
+	Round.RoundWinner = nil
+	local map = chosen:Clone()
+	local spawnPoints: {BasePart} = {}
+	for _, instance in map:GetDescendants() do
+		if instance:IsA("BasePart") then
+			if instance.Name == "SpawnPoint" then
+				instance.CanCollide, instance.CanQuery, instance.Transparency = false, false, 1
+				table.insert(spawnPoints, instance)
+			elseif not CollectionService:HasTag(instance, "Indestructible") and instance:GetAttribute("Indestructible") ~= true then
+				instance:SetAttribute("Destroyable", true)
+				CollectionService:AddTag(instance, "RoundDestroyable") -- Shatterbox only cuts parts tagged for this round
 			end
-
-			WinnerTemp.MapName.Text = ChosenMap.Name
-			task.wait(3)
-
-			local tweenTempOff = ts:Create(WinnerTemp, TweenInfo.new(.1, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Size = UDim2.fromScale(.1, .35)})
-			tweenTempOff:Play()
-			tweenTempOff.Completed:Connect(function()
-				WinnerTemp.Visible = false
-			end)
-
-			tweenEventBg(RandBg, listOfEvents, chosen)
-		end)
-	end
-
-	task.wait(10)
-
-	for _, player in pairs(Players:GetPlayers()) do
-		local mvGUI = player.PlayerGui.MapVote
-		mvGUI.MapWinBg.Visible = false
-
-		for _, button in pairs(mvGUI.bg.Container:GetChildren()) do
-			if button:IsA("GuiButton") then
-				button:Destroy()
-			end
-		end
-	end
-end
-
-local function clearVoteButtons()
-	for _, player in pairs(Players:GetPlayers()) do
-		task.spawn(function()
-			local mapsCont = player.PlayerGui.MapVote.bg.Container
-			for _, button in pairs(mapsCont:GetChildren()) do
-				if button:IsA("GuiButton") then
-					button:Destroy()
-				end
-			end
-		end)
-	end
-end
-
-module.RoundStart = function(ChosenMap)
-	local oldRig = workspace:FindFirstChild("WonRig")
-	if oldRig then
-		oldRig:SetAttribute("Winner", false)
-	end
-	MusicRemote:FireAllClients("none")
-
-	local MapClone = ChosenMap:Clone()
-	for _, obj in MapClone:GetDescendants() do
-		if obj:IsA("BasePart") then
-			obj:SetAttribute("Destroyable", true)
-		end
-	end
-	task.wait()
-	MapClone.Parent = workspace.Map
-
-	local wonRig = workspace:FindFirstChild("WonRig")
-	if wonRig then
-		wonRig:Destroy()
-	end
-
-	clearVoteButtons()
-
-	local spawnPoints = {}
-	for _, spawnPoint in pairs(MapClone:GetChildren()) do
-		if spawnPoint.Name == "SpawnPoint" then
-			table.insert(spawnPoints, spawnPoint)
 		end
 	end
 	if #spawnPoints == 0 then
-		warn("Map has no SpawnPoints: " .. ChosenMap.Name)
-		module.RoundEnd()
+		map:Destroy()
+		notice("Map has no SpawnPoints; skipping round.")
+		Round.RoundEnd()
 		return
 	end
-
-	-- pick a random event (lava rise map has its own thing going on)
-	local chosen = nil
-	if MapClone.Name ~= "Lava Rise" then
-		local listOfEvents = eventsModule.Events
-		chosen = listOfEvents[math.random(1, #listOfEvents)]
-		showMapAndEvent(ChosenMap, chosen, listOfEvents)
-	end
-
-	notice("Round Starting...")
-
-	task.wait(2)
-	if MapClone:FindFirstChild("Required") then
-		MapClone.Required.Enabled = true
-	end
-
-	local usedSpawns = {}
-
-	for _, player in pairs(Players:GetPlayers()) do
-		local char = player.Character
-		if not char then continue end
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		local hrp = char:FindFirstChild("HumanoidRootPart")
-		if not hum or not hrp or hum.Health <= 0 then continue end
-		if char:IsDescendantOf(workspace.Test.Alive) then continue end
-
-		remotes.RS:FireClient(player, "RoundStart")
-
-		for att, _ in char:GetAttributes() do
-			char:SetAttribute(att, false)
-		end
-
-		if hrp.Anchored then
-			hrp.Anchored = false
-		end
-
-		-- prefer spawns nobody is using yet
-		local availableSpawns = {}
-		for _, sp in spawnPoints do
-			if not usedSpawns[sp] then
-				table.insert(availableSpawns, sp)
-			end
-		end
-		local pool = #availableSpawns > 0 and availableSpawns or spawnPoints
-		local randomSpawn = pool[math.random(1, #pool)]
-		usedSpawns[randomSpawn] = true
-
-		hrp.CFrame = randomSpawn.CFrame
-		char.Parent = AliveFolder
-
-		local HL = Instance.new("Highlight", char)
-		HL.FillTransparency = 1
-		HL.OutlineTransparency = .5
-		HL.OutlineColor = Color3.new(1, 1, 1)
-		HL.Name = "GameHL"
-
-		-- snapshot stats so the rewards screen can show the difference
-		module.StatsInfo[player.Name] = {
-			Kills = player.leaderstats.Kills.Value,
-			Exp = player.Config.Exp.Value,
-			Cash = player.leaderstats.Cash.Value,
-			TotalExp = player.Config.MaxExp.Value,
-			Level = player.Config.Level.Value
-		}
-
-		player.PlayerGui.PlayerUIs.NotisBg.Visible = false
-
-		equipPlayerGun(player, char, hrp, WeaponsFolder)
-	end
-
-	BotService:SpawnForRound(spawnPoints, usedSpawns)
-
-	module.RoundActive = true
-	for _, char in pairs(AliveFolder:GetChildren()) do
-		if char:IsA("Model") then
-			char:SetAttribute("Locked", true)
-		end
-	end
-
-	task.delay(1, function()
-		ss.CountDown:Play()
-	end)
-
-	for i = 3, 0, -1 do
-		task.wait(1)
-		for _, char in AliveFolder:GetChildren() do
-			if char:IsA("Model") then
-				char:SetAttribute("Count", i)
+	map.Parent = mapFolder
+	local chosenEvent = Events.Events[rng:NextInteger(1, #Events.Events)]
+	if chosen.Name == "Lava Rise" then
+		for _, event in Events.Events do
+			if event.Name == "None" then
+				chosenEvent = event -- this map already has its own hazard script
 			end
 		end
 	end
-
-	for _, char in pairs(AliveFolder:GetChildren()) do
-		if char:IsA("Model") then
-			char:SetAttribute("Locked", false)
-			char:SetAttribute("Count", false)
-		end
-	end
-	BotService:UnlockRoundBots()
-
-	if chosen then
-		module.ActiveEventStop = chosen.Fn()
-	end
-
-	MusicRemote:FireAllClients("battle")
-
-	-- ends the round when 0 or 1 fighters are left
-	local WinnerCon
-	WinnerCon = game["Run Service"].Heartbeat:Connect(function()
-		if not module.RoundActive then WinnerCon:Disconnect() return end
-		local alive = AliveFolder:GetChildren()
-		if #alive == 1 then
-			module.RoundWinner = winnerReference(alive[1])
-			module.RoundEnd()
-			WinnerCon:Disconnect()
-		elseif #alive == 0 then
-			module.RoundWinner = nil
-			module.RoundEnd()
-			WinnerCon:Disconnect()
-		end
-	end)
-
-	-- exp for dying
-	local deadCon
-	deadCon = AliveFolder.ChildRemoved:Connect(function(char)
-		if not module.RoundActive then return end
-		if not char:IsA("Model") then return end
-
-		local player = Players:FindFirstChild(char.Name)
-		if not player then return end
-
-		rewardStatsModule.GiveExp(player, rewardStatsModule.CalcLoseExp(player))
-	end)
-
-	for _, child in pairs(AliveFolder:GetChildren()) do
-		if child:IsA("Model") and Players:GetPlayerFromCharacter(child) then
-			local hum = child:FindFirstChildOfClass("Humanoid")
-			if not hum then continue end
-			hum.Died:Connect(function()
-				task.wait()
-				killFeed(child.Name, child:GetAttribute("Died") or "Void")
-			end)
-		end
-	end
-
-	local leaveCon
-	leaveCon = Players.PlayerRemoving:Connect(function(leavingPlayer)
-		local char = leavingPlayer.Character
-		if char and char:IsDescendantOf(AliveFolder) then
-			char.Parent = DeadFolder
-		end
-
-		task.wait()
-		if not module.RoundActive then return end
-		local alive = AliveFolder:GetChildren()
-		if #alive == 1 then
-			module.RoundWinner = winnerReference(alive[1])
-			module.RoundEnd()
-		elseif #alive == 0 then
-			module.RoundWinner = nil
-			module.RoundEnd()
-		end
-	end)
-
-	-- main round timer
-	local elapsed = 0
-	local lavaTriggered = false
-
-	while module.RoundActive and elapsed < module.RoundTime do
-		task.wait(1)
-		if not module.RoundActive then
-			break
-		end
-
-		elapsed += 1
-
-		local remaining = module.RoundTime - elapsed
-		local text
-		if remaining > 60 then
-			text = string.format("%d:%02d", math.floor(remaining / 60), remaining % 60)
-		else
-			text = tostring(remaining) .. "s"
-		end
-
-		notice(text)
-
-		-- lava starts rising for the last 30 seconds
-		if not lavaTriggered and remaining <= 30 and ChosenMap.Name ~= "Lava Rise" then
-			if chosen and chosen.Name == "Lava Drain" then continue end
-
-			lavaTriggered = true
-			module.ActiveLava, module.ActiveLavaTween = StartRisingLava(remaining)
-
-			for _, c in pairs(workspace.Alive:GetChildren()) do
-				if c:IsA("Model") and c:FindFirstChild("Humanoid") then
-					local plr = Players:GetPlayerFromCharacter(c)
-					if plr then
-						remotes.RS:FireClient(plr, "RisingLava")
-					end
-				end
-			end
-		end
-	end
-
-	leaveCon:Disconnect()
-	deadCon:Disconnect()
-	pcall(function() WinnerCon:Disconnect() end)
-
-	if module.RoundActive then
-		notice("Time Ran Out!")
-		module.RoundEnd()
-	end
-end
-
-local function showRewards()
-	for _, player in pairs(Players:GetPlayers()) do
-		if not player.Character then continue end
-		local snap = module.StatsInfo[player.Name]
-		if not snap then continue end
-
-		local differenceKills = player.leaderstats.Kills.Value - snap.Kills
-		local differenceCash = player.leaderstats.Cash.Value - snap.Cash
-		local levelDiff = player.Config.Level.Value - snap.Level
-		-- if they leveled up, add the exp bars they went through
-		local differenceExp = math.max(0, player.Config.Exp.Value - snap.Exp + (player.Config.MaxExp.Value * levelDiff))
-
-		local rewardsBg = player.PlayerGui.PlayerUIs.RewardsBg
-		local pat = rewardsBg.RewardsContainer.pat
-
-		rewardsBg.Visible = true
-		pat.KillsTemp.RewardText.Text = "+" .. format(differenceKills)
-		pat.CashTemp.RewardText.Text = "+" .. format(differenceCash)
-		pat.ExpTemp.RewardText.Text = "+" .. format(differenceExp)
-	end
-end
-
-module.RoundEnd = function()
-	if not module.RoundActive then return end
-	module.RoundActive = false
-	BotService:EndRound()
-
-	if module.ActiveEventStop then
-		module.ActiveEventStop()
-		module.ActiveEventStop = nil
-	end
-
-	if module.ActiveLavaTween then
-		module.ActiveLavaTween:Cancel()
-		module.ActiveLavaTween = nil
-	end
-	if module.ActiveLava then
-		module.ActiveLava:Destroy()
-		module.ActiveLava = nil
-	end
-
-	-- send everyone back to the lobby
-	for _, player in pairs(Players:GetPlayers()) do
-		local char = player.Character
-		if not char then continue end
-		if char:IsDescendantOf(workspace.Test.Alive) then continue end
-		remotes.RS:FireClient(player, "RoundEnd")
-
-		pcall(function()
-			char.Parent = DeadFolder
-			if char:FindFirstChild("GameHL") then
-				char.GameHL:Destroy()
-			end
-			char:SetAttribute("EquippedWeapon", nil)
-			for _, v in char:GetChildren() do
-				if v:IsA("Model") and v:GetAttribute("Weapon") then
-					v:Destroy()
-				end
-			end
-		end)
-	end
-
-	cleanupFolders()
-
-	if module.RoundWinner then
-		local winnerPlayer = module.RoundWinner:IsA("Player") and module.RoundWinner or nil
-		local winnerCharacter = winnerPlayer and winnerPlayer.Character or module.RoundWinner
-
-		if winnerCharacter then
-			notice(winnerCharacter.Name .. " won the round!")
-			MusicRemote:FireAllClients("winner")
-
-			if winnerPlayer then
-				rewardStatsModule.GiveWin(winnerPlayer, 1)
-				rewardStatsModule.GiveExp(winnerPlayer, rewardStatsModule.CalcWinExp(winnerPlayer))
-				rewardStatsModule.GiveCash(winnerPlayer, 500)
-
-				if IsCharacterAliveAndValid(winnerCharacter) then
-					task.delay(8, function() EmitWinFX(winnerCharacter) end)
-					game.ServerScriptService.Scripts.PlayWinner.WonRig:SetAttribute("Winner", winnerPlayer.Name)
-				end
-			end
-		end
-		task.wait(8)
-	end
-
-	showRewards()
-	module.StatsInfo = {}
-
-	cleanupFolders()
-
-	MusicRemote:FireAllClients("lobby", math.random(0, math.floor(LobbyMusic.TimeLength * 0.75)))
-	module.RoundWinner = nil
-end
-
-module.IntermissionStart = function()
+	announceMap(chosen, chosenEvent.Name)
+	music:FireAllClients("none")
 	task.wait(3)
-	notice("Intermission...")
-	for _, plr in game.Players:GetPlayers() do
-		remotes.RS:FireClient(plr, "skiesFIX")
+	if generation ~= token then
+		return
 	end
-	task.wait(module.IntermissionTime - 3)
-	notice("Voting...")
-	module.CanVote = true
-
-	local ChosenMap = module.VoteStart()
-	module.CanVote = false
-	if ChosenMap then
-		module.RoundStart(ChosenMap)
-	end
-end
-
-return module
-
-
-
------------------------- MapVoteController --------------------------
-(ModuleScript, child of the round script / ServerScriptService)
-
-local MapFolder = game.ServerStorage.Maps
-local TemplateFrame = script.MapTemplate
-local DeadFolder = workspace:WaitForChild("Dead")
-
-local module = {}
-module.ChosenMaps = {}
-module.Voted = {}
-module.PreviousVoted = {}
-module.MapSelected = nil
-
-local function isValidMap(name)
-	for _, map in module.ChosenMaps do
-		if map.Name == name then return true end
-	end
-	return false
-end
-
-module.Vote = function(player, mapVoted)
-	if module.Voted[player] == mapVoted then warn("already voted for " .. mapVoted) return end
-	if not isValidMap(mapVoted) then warn("voted for nil map") return end
-
-	module.Voted[player] = mapVoted
-
-	if module.PreviousVoted[player] then
-		local prev = module.PreviousVoted[player]
-		local oldVal = script.Votes:FindFirstChild(prev)
-		if oldVal then oldVal.Value -= 1 end
-	end
-
-	local voteVal = script.Votes:FindFirstChild(mapVoted)
-	if voteVal then voteVal.Value += 1 end
-
-	module.PreviousVoted[player] = mapVoted
-end
-
-local function isLobbyPlayer(player)
-	local character = player.Character
-	return character and character:IsDescendantOf(DeadFolder)
-end
-
-module.Start = function()
-	module.ChosenMaps = {}
-	module.Voted = {}
-	module.PreviousVoted = {}
-	
-	for _, v in script.Votes:GetChildren() do
-		v:Destroy()
-	end
-	
-	for _, plr in game.Players:GetPlayers() do
-		local container = plr.PlayerGui.MapVote.bg.Container
-		for _, child in container:GetChildren() do
-			if child:IsA("Frame") then child:Destroy() end
-		end
-	end
-	
-	local allMaps = MapFolder:GetChildren()
-	for i = #allMaps, 2, -1 do
-		local j = math.random(1, i)
-		allMaps[i], allMaps[j] = allMaps[j], allMaps[i]
-	end
-	for i = 1, math.min(3, #allMaps) do
-		table.insert(module.ChosenMaps, allMaps[i])
-	end
-
-	for _, map in module.ChosenMaps do
-		local voteVal = Instance.new("IntValue", script.Votes)
-		voteVal.Name = map.Name
-		voteVal.Value = 0
-	end
-
-	for _, plr in game.Players:GetPlayers() do
-		if not isLobbyPlayer(plr) then
+	local used: {[BasePart]: boolean} = {}
+	for _, player in Players:GetPlayers() do
+		visible(ui(player, {"MapVote", "MapWinBg"}), false)
+		local character = player.Character
+		local root = if character then rootOf(character) else nil
+		local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+		if not character or character.Parent ~= dead or inPractice(character) or not root or not humanoid or humanoid.Health <= 0 then
 			continue
 		end
-		
-		task.spawn(function()
-			local gui = plr.PlayerGui.MapVote
-			local bg = gui.bg
-			local container = bg.Container
-
-			for i, map in ipairs(module.ChosenMaps) do
-				local newFrame = TemplateFrame:Clone()
-				newFrame.MapName.Text = map.Name
-
-				local countBg = newFrame.counterbg
-				local countAmt = countBg.CountAmt
-
-				local voteVal = script.Votes:FindFirstChild(map.Name)
-				if voteVal then
-					countAmt.Text = tostring(voteVal.Value)
-					voteVal.Changed:Connect(function(newVal)
-						countAmt.Text = tostring(newVal)
-					end)
-				end
-
-				if map:GetAttribute("Attribute") then
-					newFrame.Attributes.Text = map:GetAttribute("Attribute")
-				end
-				if map:GetAttribute("Image") then
-					newFrame.MapImage.Image = "rbxassetid://"..map:GetAttribute("Image")
-				end
-				if map:GetAttribute("AttColor") then
-					newFrame.Attributes.BackgroundColor3 = map:GetAttribute("AttColor")
-				end
-				newFrame.ZIndex = newFrame.ZIndex + i
-				for _, desc in newFrame:GetDescendants() do
-					if desc:IsA("GuiObject") then
-						desc.ZIndex = desc.ZIndex + i
-					end
-				end
-				newFrame.Name = map.Name
-				newFrame.Parent = container
+		if not equip(player, character, root) then
+			warn("Round enrollment requires a valid owned ActiveGun:", player.Name)
+			continue
+		end
+		local open: {BasePart} = {}
+		for _, point in spawnPoints do
+			if not used[point] then
+				table.insert(open, point)
 			end
-
-			bg.Visible = true
-		end)
+		end
+		local pool = if #open > 0 then open else spawnPoints
+		local point = pool[rng:NextInteger(1, #pool)]
+		used[point] = true
+		Round.StatsInfo[player.Name] = snapshot(player)
+		Cooldowns:ClearPlayer(player)
+		for _, attribute in {"UsingSkill", "SkillDebounce", "Stunned", "Frozen", "Slowed"} do
+			character:SetAttribute(attribute, false)
+		end
+		character:SetAttribute("Locked", true)
+		character:PivotTo(point.CFrame * CFrame.new(0, 3, 0))
+		root.AssemblyLinearVelocity, root.AssemblyAngularVelocity, root.Anchored = Vector3.zero, Vector3.zero, true
+		character.Parent = alive
+		local highlight = Instance.new("Highlight")
+		highlight.Name, highlight.FillTransparency, highlight.OutlineTransparency, highlight.Parent = "GameHL", 1, 0.5, character
+		register(character, player, token)
+		roundRemote:FireClient(player, "RoundStart")
 	end
-end
-
-module.End = function()
-	for _, plr in game.Players:GetPlayers() do
-		task.spawn(function()
-			local gui = plr.PlayerGui.MapVote
-			local bg = gui.bg
-			local container = bg.Container
-
-			for _, child in container:GetChildren() do
-				if child:IsA("Frame") then child:Destroy() end
-			end
-			bg.Visible = false
-		end)
-	end
-
-	local winners = {}
-	local highestVotes = -1
-	for _, vote in script.Votes:GetChildren() do
-		if vote.Value > highestVotes then
-			highestVotes = vote.Value
-			winners = { vote.Name }
-		elseif vote.Value == highestVotes then
-			table.insert(winners, vote.Name)
+	BotService:SpawnForRound(spawnPoints, used)
+	for _, character in alive:GetChildren() do
+		if character:IsA("Model") and character:GetAttribute("RoundBot") == true then
+			register(character, nil, token)
 		end
 	end
-
-	if highestVotes == 0 then
-		print("Nobody voted! Picking random...")
-		module.MapSelected = module.ChosenMaps[math.random(1, #module.ChosenMaps)].Name
-	else
-		if #winners > 1 then print("Tie! Picking randomly...") end
-		module.MapSelected = winners[math.random(1, #winners)]
+	table.insert(connections, Players.PlayerRemoving:Connect(function(player: Player): ()
+		local character = player.Character
+		local entry = if character then contestants[character] else nil
+		if entry then
+			eliminate(entry, false) -- remove the leaving player without giving loss rewards
+		end
+	end))
+	local killPlane = Workspace:FindFirstChild("KillForceField")
+	if killPlane and killPlane:IsA("BasePart") then
+		table.insert(connections, killPlane.Touched:Connect(function(hit: BasePart): ()
+			local ancestor: Instance? = hit
+			while ancestor and ancestor ~= Workspace do
+				local entry = if ancestor:IsA("Model") then contestants[ancestor] else nil
+				if entry then
+					entry.humanoid.Health = 0
+					return
+				end
+				ancestor = ancestor.Parent -- keep going up so weapon and accessory parts still find the character
+			end
+		end))
 	end
-
-	print("Winning map: " .. (module.MapSelected or "none"))
-
-	for _, vote in script.Votes:GetChildren() do vote:Destroy() end
-
-	local selected = module.MapSelected
-	module.ChosenMaps = {}
-	module.Voted = {}
-	module.PreviousVoted = {}
-	module.MapSelected = nil
-
-	return MapFolder:FindFirstChild(selected):FindFirstChild(selected)
+	for count = 3, 1, -1 do
+		if generation ~= token then
+			return
+		end
+		for _, entry in contestants do
+			entry.character:SetAttribute("Count", count)
+		end
+		local sound = SoundService:FindFirstChild("CountDown")
+		if count == 3 and sound and sound:IsA("Sound") then
+			sound:Play()
+		end
+		task.wait(1)
+	end
+	if generation ~= token then
+		return
+	end
+	for _, entry in contestants do
+		entry.root.Anchored = false
+		entry.character:SetAttribute("Locked", false)
+		entry.character:SetAttribute("Count", nil)
+	end
+	phase, Round.RoundActive = "Active", true
+	BotService:UnlockRoundBots()
+	local required = map:FindFirstChild("Required")
+	if required and required:IsA("Script") then
+		required.Enabled = true
+	end
+	Round.ActiveEventStop = chosenEvent.Fn(Round.RoundTime)
+	music:FireAllClients("battle")
+	local deadline, lastSecond, rising = os.clock() + Round.RoundTime, -1, false
+	while generation == token and currentPhase() == "Active" do
+		local living = survivors()
+		if #living <= 1 then
+			local winner = living[1]
+			Round.RoundWinner = if winner then winner.player or winner.character else nil
+			break
+		end
+		local remaining = math.max(0, math.ceil(deadline - os.clock()))
+		if remaining ~= lastSecond then
+			lastSecond = remaining
+			notice(string.format("%d:%02d", math.floor(remaining / 60), remaining % 60))
+		end
+		if remaining == 0 then
+			notice("Time ran out!")
+			break -- more than one survivor at timeout means a draw
+		end
+		if not rising and remaining <= 30 and chosen.Name ~= "Lava Rise" and chosenEvent.Name ~= "Lava Drain" then
+			rising = true
+			Round.ActiveLavaStop = Events.StartRisingLava(remaining)
+			for _, entry in living do
+				if entry.player then
+					roundRemote:FireClient(entry.player, "RisingLava")
+				end
+			end
+		end
+		task.wait(0.1) -- the deadline uses real elapsed time instead of counting waits
+	end
+	if generation == token then
+		Round.RoundEnd()
+	end
 end
 
-return module
+function Round.IntermissionStart(): ()
+	if phase ~= "Idle" then
+		return
+	end
+	phase = "Voting" -- reserve the intermission so another loop cannot start a second vote
+	notice("Intermission...")
+	for _, player in Players:GetPlayers() do
+		roundRemote:FireClient(player, "skiesFIX")
+	end
+	task.wait(Round.IntermissionTime)
+	notice("Voting...")
+	Round.CanVote = true
+	local chosen = Round.VoteStart()
+	Round.CanVote = false
+	phase = "Idle"
+	if chosen then
+		Round.RoundStart(chosen)
+	else
+		notice("No valid maps are configured.")
+	end
+end
+
+return Round
