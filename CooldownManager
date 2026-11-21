@@ -1,0 +1,129 @@
+-- Discord: synth._ | Roblox: FNFmaster111
+--!strict
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local remote = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Replicate") :: RemoteEvent
+type Cooldown = {BaseCooldown: number, Multiplier: number, Duration: number, EndTime: number}
+local entries: {[Player]: {[string]: Cooldown}} = {}
+local CooldownManager = {PlayerCooldowns = entries}
+
+local function finite(value: number): boolean
+	return value == value and math.abs(value) < math.huge -- NaN is not equal to itself, so this also rejects invalid numbers
+end
+
+local function multiplier(player: Player): number
+	local character = player.Character
+	local value = if character then character:GetAttribute("CooldownMultiplier") else nil
+	return if typeof(value) == "number" and finite(value) then math.clamp(value, 0.05, 10) else 1
+end
+
+local function notify(player: Player, key: string, action: string, remaining: number): ()
+	if player.Parent == Players then
+		remote:FireClient(player, {
+			Key = key, Function = action, Duration = remaining,
+			EndTime = Workspace:GetServerTimeNow() + remaining, -- clients need a shared clock for the cooldown display
+		})
+	end
+end
+
+function CooldownManager.Stop(_self: unknown, player: Player, key: string): ()
+	local bucket = entries[player]
+	if bucket and bucket[key] then
+		bucket[key] = nil
+		notify(player, key, "StopCooldown", 0)
+		if next(bucket) == nil then
+			entries[player] = nil -- remove the empty table when no cooldowns are left
+		end
+	end
+end
+
+function CooldownManager.GetRemaining(_self: unknown, player: Player, key: string): number
+	local bucket = entries[player]
+	local entry = if bucket then bucket[key] else nil
+	if not entry then
+		return 0
+	end
+	local remaining = math.max(0, entry.EndTime - os.clock())
+	if remaining == 0 then
+		CooldownManager:Stop(player, key)
+	end
+	return remaining
+end
+
+function CooldownManager.IsOnCooldown(_self: unknown, player: Player, key: string): boolean
+	return CooldownManager:GetRemaining(player, key) > 0
+end
+
+function CooldownManager.Start(_self: unknown, player: Player, key: string, baseCooldown: number): number
+	assert(finite(baseCooldown) and baseCooldown >= 0, "Cooldown must be a finite nonnegative number")
+	local scale = multiplier(player)
+	local duration = math.max(baseCooldown * scale, 0.001)
+	local bucket = entries[player]
+	if not bucket then
+		bucket = {}
+		entries[player] = bucket
+	end
+	bucket[key] = {BaseCooldown = baseCooldown, Multiplier = scale, Duration = duration, EndTime = os.clock() + duration}
+	notify(player, key, "StartCooldown", duration)
+	return duration
+end
+
+function CooldownManager.ReduceRemaining(_self: unknown, player: Player, key: string, amount: number): ()
+	assert(finite(amount) and amount >= 0, "Reduction must be a finite nonnegative number")
+	local bucket = entries[player]
+	local entry = if bucket then bucket[key] else nil
+	if not entry then
+		return
+	end
+	entry.EndTime = math.max(os.clock(), entry.EndTime - amount)
+	local remaining = CooldownManager:GetRemaining(player, key)
+	if remaining > 0 then
+		notify(player, key, "UpdateCooldown", remaining)
+	end
+end
+
+function CooldownManager.SetMultiplier(_self: unknown, player: Player, value: number): ()
+	assert(finite(value), "Multiplier must be finite")
+	local scale, now = math.clamp(value, 0.05, 10), os.clock()
+	if player.Character then
+		player.Character:SetAttribute("CooldownMultiplier", scale)
+	end
+	local bucket = entries[player]
+	if not bucket then
+		return
+	end
+	local keys: {string} = {}
+	for key in bucket do
+		table.insert(keys, key) -- snapshot first because Stop can remove entries
+	end
+	for _, key in keys do
+		local entry = bucket[key]
+		local fraction = math.clamp((entry.EndTime - now) / entry.Duration, 0, 1)
+		if fraction == 0 then
+			CooldownManager:Stop(player, key)
+		else
+			entry.Multiplier, entry.Duration = scale, math.max(entry.BaseCooldown * scale, 0.001)
+			local remaining = entry.Duration * fraction
+			entry.EndTime = now + remaining -- keep the completed progress when the multiplier changes again
+			notify(player, key, "UpdateCooldown", remaining)
+		end
+	end
+end
+
+function CooldownManager.ClearPlayer(_self: unknown, player: Player): ()
+	local bucket = entries[player]
+	entries[player] = nil
+	if bucket then
+		for key in bucket do
+			notify(player, key, "StopCooldown", 0)
+		end
+	end
+end
+
+Players.PlayerRemoving:Connect(function(player: Player): ()
+	CooldownManager:ClearPlayer(player)
+end)
+
+return CooldownManager
