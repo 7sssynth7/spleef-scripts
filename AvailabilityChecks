@@ -1,0 +1,24 @@
+-- Discord: synth._ | Roblox: FNFmaster111
+--!strict
+
+-- keep the instance named AvailablitiyChecks for existing requires
+local AvailabilityChecks = {}
+local blockedAttributes = table.freeze({"Stunned", "Frozen", "SkillDebounce", "UsingSkill", "Locked"})
+
+function AvailabilityChecks.Check(character: Model?): boolean
+	if not character or not character.Parent then
+		return true
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return true -- missing or dead characters cannot use skills
+	end
+	for _, attribute in blockedAttributes do
+		if character:GetAttribute(attribute) == true then
+			return true -- stop at the first blocked flag instead of building another table
+		end
+	end
+	return false
+end
+
+return AvailabilityChecks
